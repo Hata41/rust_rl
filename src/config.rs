@@ -26,6 +26,18 @@ pub struct Args {
     #[arg(long, default_value_t = 2000)]
     pub num_updates: usize,
 
+    /// Number of updates between deterministic evaluations
+    #[arg(long, default_value_t = 20)]
+    pub eval_interval: usize,
+
+    /// Number of environments to use for deterministic evaluation
+    #[arg(long, default_value_t = 32)]
+    pub num_eval_envs: usize,
+
+    /// Total completed episodes to collect per deterministic evaluation
+    #[arg(long, default_value_t = 32)]
+    pub num_eval_episodes: usize,
+
     /// PPO epochs per update
     #[arg(long, default_value_t = 4)]
     pub epochs: usize,

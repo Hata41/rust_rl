@@ -96,6 +96,10 @@ impl DashboardFormatter {
             "global_grad_norm" => return "Grad norm".to_string(),
             "steps_per_second" => return "Steps per second".to_string(),
             "learning_rate" => return "Learning rate".to_string(),
+            "critic_loss" => return "Critic loss".to_string(),
+            "episode_length_mean" => return "Episode length mean".to_string(),
+            "episode_length_max" => return "Episode length max".to_string(),
+            "episode_length_min" => return "Episode length min".to_string(),
             _ => {}
         }
 

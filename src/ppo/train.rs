@@ -17,7 +17,9 @@ use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
 use crate::models::{Actor, Agent, Critic};
 use crate::ppo::buffer::{flatten_obs, parse_binpack_obs, Rollout};
-use crate::ppo::loss::{compute_ppo_losses, logprob_and_entropy, sample_actions_gumbel};
+use crate::ppo::loss::{
+    compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_gumbel,
+};
 
 fn build_binpack_batch_tensors<B: AutodiffBackend>(
     obs_batch: &[GenericObs],
@@ -164,6 +166,153 @@ fn clip_global_grad_norm<Bk: AutodiffBackend>(
     total_norm
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EvalStats {
+    mean_return: f32,
+    max_return: f32,
+    min_return: f32,
+    mean_ep_len: f32,
+    max_ep_len: usize,
+    min_ep_len: usize,
+    episodes: usize,
+}
+
+fn run_deterministic_eval<B: AutodiffBackend>(
+    agent: &Agent<B>,
+    eval_pool: &AsyncEnvPool,
+    eval_seed: u64,
+    num_eval_envs: usize,
+    num_eval_episodes: usize,
+    is_binpack: bool,
+    obs_dim: usize,
+    action_dim: usize,
+    max_items: usize,
+    max_ems: usize,
+    device: &B::Device,
+) -> Result<EvalStats> {
+    if num_eval_envs == 0 || num_eval_episodes == 0 {
+        return Ok(EvalStats {
+            mean_return: 0.0,
+            max_return: 0.0,
+            min_return: 0.0,
+            mean_ep_len: 0.0,
+            max_ep_len: 0,
+            min_ep_len: 0,
+            episodes: 0,
+        });
+    }
+
+    let reset_out = eval_pool.reset_all(Some(eval_seed))?;
+    let mut cur_obs = reset_out.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
+    let mut cur_mask = reset_out
+        .iter()
+        .map(|s| s.action_mask.clone())
+        .collect::<Vec<_>>();
+
+    let mut ep_return = vec![0.0f32; num_eval_envs];
+    let mut ep_len = vec![0usize; num_eval_envs];
+    let mut completed_returns = Vec::<f32>::with_capacity(num_eval_episodes);
+    let mut completed_lengths = Vec::<usize>::with_capacity(num_eval_episodes);
+
+    while completed_returns.len() < num_eval_episodes {
+        let mut mask_f = vec![0.0f32; num_eval_envs * action_dim];
+        for e in 0..num_eval_envs {
+            let row = e * action_dim;
+            for a in 0..action_dim {
+                mask_f[row + a] = if cur_mask[e][a] { 1.0 } else { 0.0 };
+            }
+        }
+        let mask_t = Tensor::<B, 2>::from_data(
+            TensorData::new(mask_f, [num_eval_envs, action_dim]),
+            device,
+        );
+
+        let logits = if is_binpack {
+            let (items_t, ems_t, items_pad_t, ems_pad_t, _items_valid_t, _ems_valid_t) =
+                build_binpack_batch_tensors::<B>(&cur_obs, max_items, max_ems, device)?;
+
+            agent
+                .actor
+                .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t)
+                .detach()
+        } else {
+            let mut obs_flat_all = vec![0.0f32; num_eval_envs * obs_dim];
+            for e in 0..num_eval_envs {
+                let flat = flatten_obs(&cur_obs[e]);
+                let base = e * obs_dim;
+                obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
+            }
+            let obs_t = Tensor::<B, 2>::from_data(
+                TensorData::new(obs_flat_all, [num_eval_envs, obs_dim]),
+                device,
+            );
+            agent.actor.forward(obs_t).detach()
+        };
+
+        let actions_t = masked_logits(logits, mask_t).argmax(1).squeeze::<1>();
+
+        let actions_data = actions_t.to_data();
+        let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
+            Ok(v) => v,
+            Err(_) => actions_data
+                .to_vec::<i64>()
+                .map_err(|e| anyhow::anyhow!("failed to convert greedy actions: {e}"))?
+                .into_iter()
+                .map(|v| v as i32)
+                .collect(),
+        };
+
+        let step_out = eval_pool.step_all(&actions_vec)?;
+
+        for e in 0..num_eval_envs {
+            ep_return[e] += step_out[e].reward;
+            ep_len[e] += 1;
+
+            if step_out[e].done {
+                if completed_returns.len() < num_eval_episodes {
+                    completed_returns.push(ep_return[e]);
+                    completed_lengths.push(ep_len[e]);
+                }
+                ep_return[e] = 0.0;
+                ep_len[e] = 0;
+            }
+        }
+
+        for e in 0..num_eval_envs {
+            cur_obs[e] = step_out[e].obs.clone();
+            cur_mask[e] = step_out[e].action_mask.clone();
+        }
+    }
+
+    let episodes = completed_returns.len();
+    let mean_return = completed_returns.iter().sum::<f32>() / (episodes as f32);
+    let max_return = completed_returns
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_return = completed_returns
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    let mean_ep_len = completed_lengths
+        .iter()
+        .map(|v| *v as f32)
+        .sum::<f32>()
+        / (episodes as f32);
+    let max_ep_len = *completed_lengths.iter().max().unwrap_or(&0);
+    let min_ep_len = *completed_lengths.iter().min().unwrap_or(&0);
+
+    Ok(EvalStats {
+        mean_return,
+        max_return,
+        min_return,
+        mean_ep_len,
+        max_ep_len,
+        min_ep_len,
+        episodes,
+    })
+}
+
 pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) -> Result<()> {
     let is_lead = dist.rank == 0;
 
@@ -244,6 +393,20 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     let mut recent_lengths: Vec<usize> = Vec::with_capacity(256);
 
     let mut rng = StdRng::seed_from_u64(args.seed ^ 0xA11CE);
+
+    let eval_num_envs = args.num_eval_envs;
+    if is_lead && eval_num_envs == 0 {
+        bail!("num_eval_envs must be > 0 on lead rank");
+    }
+
+    let eval_pool = if is_lead {
+        Some(AsyncEnvPool::new(eval_num_envs, args.seed + 999, {
+            let args = args.clone();
+            move |seed| make_env(&args.task_id, &args, seed).unwrap()
+        })?)
+    } else {
+        None
+    };
 
     for update in 0..args.num_updates {
         let update_span = span!(
@@ -430,10 +593,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let mb_size = local_batch / args.num_minibatches;
         let mut all_indices: Vec<usize> = (0..local_batch).collect();
 
-        let mut last_actor_loss = 0.0f32;
-        let mut last_critic_loss = 0.0f32;
-        let mut last_entropy = 0.0f32;
-        let mut last_global_grad_norm = 0.0f32;
+        let mut actor_loss_sum = 0.0f64;
+        let mut critic_loss_sum = 0.0f64;
+        let mut entropy_sum = 0.0f64;
+        let mut grad_norm_sum = 0.0f64;
 
         let optimization_started = Instant::now();
         {
@@ -616,7 +779,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             .map_err(|e| anyhow::anyhow!("failed critic gradient all-reduce: {e:?}"))?;
                     }
 
-                    last_global_grad_norm = clip_global_grad_norm(
+                    let global_grad_norm = clip_global_grad_norm(
                         &agent.actor,
                         &agent.critic,
                         &mut grads_actor,
@@ -627,9 +790,35 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     agent.actor = actor_optim.step(current_actor_lr, agent.actor, grads_actor);
                     agent.critic = critic_optim.step(current_critic_lr, agent.critic, grads_critic);
 
-                    last_actor_loss = parts.actor_loss.to_data().to_vec::<f32>().unwrap()[0];
-                    last_critic_loss = parts.value_loss.to_data().to_vec::<f32>().unwrap()[0];
-                    last_entropy = parts.entropy_mean.to_data().to_vec::<f32>().unwrap()[0];
+                    let actor_loss = parts
+                        .actor_loss
+                        .to_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0);
+                    let critic_loss = parts
+                        .value_loss
+                        .to_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0);
+                    let entropy = parts
+                        .entropy_mean
+                        .to_data()
+                        .to_vec::<f32>()
+                        .unwrap_or_default()
+                        .first()
+                        .copied()
+                        .unwrap_or(0.0);
+
+                    actor_loss_sum += actor_loss as f64;
+                    critic_loss_sum += critic_loss as f64;
+                    entropy_sum += entropy as f64;
+                    grad_norm_sum += global_grad_norm as f64;
 
                     if is_lead {
                         debug!(
@@ -637,10 +826,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             update,
                             epoch,
                             minibatch = mb,
-                            actor_loss = last_actor_loss,
-                            value_loss = last_critic_loss,
-                            entropy = last_entropy,
-                            global_grad_norm = last_global_grad_norm,
+                            actor_loss,
+                            critic_loss,
+                            entropy,
+                            global_grad_norm,
                             learning_rate = current_actor_lr,
                             "minibatch"
                         );
@@ -650,7 +839,14 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         }
         let optimization_elapsed = optimization_started.elapsed();
 
-        if is_lead && update % 10 == 0 {
+        if is_lead {
+            let num_updates_in_cycle = (args.epochs * args.num_minibatches) as f64;
+            let denom = num_updates_in_cycle.max(1.0);
+            let mean_actor_loss = actor_loss_sum / denom;
+            let mean_critic_loss = critic_loss_sum / denom;
+            let mean_entropy = entropy_sum / denom;
+            let mean_global_grad_norm = grad_norm_sum / denom;
+
             let mean_return = if recent_returns.is_empty() {
                 0.0
             } else {
@@ -665,6 +861,15 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     .iter()
                     .copied()
                     .fold(f32::NEG_INFINITY, f32::max)
+            };
+            let min_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                let k = recent_returns.len().min(100);
+                recent_returns[recent_returns.len() - k..]
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min)
             };
             let mean_ep_len = if recent_lengths.is_empty() {
                 0.0
@@ -685,33 +890,49 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     .max()
                     .unwrap_or(&0)
             };
+            let min_ep_len = if recent_lengths.is_empty() {
+                0
+            } else {
+                let k = recent_lengths.len().min(100);
+                *recent_lengths[recent_lengths.len() - k..]
+                    .iter()
+                    .min()
+                    .unwrap_or(&0)
+            };
 
             let adv_stats = roll.advantage_stats();
 
-            let rollout_steps = (args.rollout_length * local_num_envs * dist.world_size) as f64;
-            let rollout_secs = rollout_elapsed.as_secs_f64().max(1.0e-9);
-            let steps_per_second = rollout_steps / rollout_secs;
+            let rollout_steps = (args.rollout_length * args.num_envs) as f64;
+            let total_update_secs =
+                (rollout_elapsed + optimization_elapsed).as_secs_f64().max(1.0e-9);
+            let steps_per_second = rollout_steps / total_update_secs;
 
             let timesteps = (update + 1) * local_batch * dist.world_size;
             info!(
                 category = "TRAINER",
-                actor_loss = last_actor_loss,
-                value_loss = last_critic_loss,
-                entropy = last_entropy,
-                global_grad_norm = last_global_grad_norm,
+                policy_version = update + 1,
+                actor_loss = mean_actor_loss,
+                critic_loss = mean_critic_loss,
+                entropy = mean_entropy,
+                global_grad_norm = mean_global_grad_norm,
                 "train"
             );
 
             info!(
                 category = "ACTOR",
+                phase = "Training/Actor",
                 mean_return,
                 max_return,
-                episode_length = mean_ep_len,
+                min_return,
+                episode_length_mean = mean_ep_len,
+                episode_length_max = max_ep_len,
+                episode_length_min = min_ep_len,
                 "actor"
             );
 
             info!(
                 category = "MISC",
+                timesteps,
                 steps_per_second,
                 learning_rate = current_actor_lr,
                 "misc"
@@ -726,9 +947,46 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 advantage_pre_std = adv_stats.pre_std,
                 advantage_post_mean = adv_stats.post_mean,
                 advantage_post_std = adv_stats.post_std,
-                episode_length_max = max_ep_len,
                 "details"
             );
+        }
+
+        if is_lead
+            && args.eval_interval > 0
+            && (update % args.eval_interval == 0)
+            && args.num_eval_episodes > 0
+        {
+            if let Some(eval_pool) = eval_pool.as_ref() {
+                let eval_started = Instant::now();
+                let eval_stats = run_deterministic_eval::<B>(
+                    &agent,
+                    eval_pool,
+                    args.seed + 999,
+                    eval_num_envs,
+                    args.num_eval_episodes,
+                    is_binpack,
+                    obs_dim,
+                    action_dim,
+                    args.max_items,
+                    args.max_ems,
+                    &device,
+                )?;
+
+                info!(
+                    category = "EVALUATOR",
+                    phase = "Evaluator",
+                    policy_version = update + 1,
+                    episodes = eval_stats.episodes,
+                    mean_return = eval_stats.mean_return,
+                    max_return = eval_stats.max_return,
+                    min_return = eval_stats.min_return,
+                    episode_length_mean = eval_stats.mean_ep_len,
+                    episode_length_max = eval_stats.max_ep_len,
+                    episode_length_min = eval_stats.min_ep_len,
+                    duration_ms = eval_started.elapsed().as_secs_f64() * 1_000.0,
+                    "deterministic_eval"
+                );
+            }
         }
     }
 
