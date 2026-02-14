@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use bitvec::prelude::*;
 use rustpool::core::types::{ArrayData, GenericObs};
 
@@ -11,6 +12,73 @@ pub fn flatten_obs(obs: &GenericObs) -> Vec<f32> {
         }
     }
     out
+}
+
+#[derive(Clone, Debug)]
+pub struct BinPackObsView {
+    pub items: Vec<f32>,
+    pub ems: Vec<f32>,
+    pub items_valid: Vec<bool>,
+    pub ems_valid: Vec<bool>,
+}
+
+pub fn parse_binpack_obs(obs: &GenericObs, max_items: usize, max_ems: usize) -> Result<BinPackObsView> {
+    if obs.len() < 5 {
+        bail!("binpack obs must have at least 5 entries, got {}", obs.len());
+    }
+
+    let items = match &obs[0] {
+        ArrayData::Float32(v) => v.clone(),
+        _ => bail!("binpack items must be Float32"),
+    };
+    let ems = match &obs[1] {
+        ArrayData::Float32(v) => v.clone(),
+        _ => bail!("binpack ems must be Float32"),
+    };
+    let items_valid = match &obs[2] {
+        ArrayData::Bool(v) => v.clone(),
+        _ => bail!("binpack items_mask must be Bool"),
+    };
+    let ems_valid = match &obs[4] {
+        ArrayData::Bool(v) => v.clone(),
+        _ => bail!("binpack ems_mask must be Bool"),
+    };
+
+    if items.len() != max_items * 3 {
+        bail!(
+            "binpack items length mismatch: expected {}, got {}",
+            max_items * 3,
+            items.len()
+        );
+    }
+    if ems.len() != max_ems * 6 {
+        bail!(
+            "binpack ems length mismatch: expected {}, got {}",
+            max_ems * 6,
+            ems.len()
+        );
+    }
+    if items_valid.len() != max_items {
+        bail!(
+            "binpack items_mask length mismatch: expected {}, got {}",
+            max_items,
+            items_valid.len()
+        );
+    }
+    if ems_valid.len() != max_ems {
+        bail!(
+            "binpack ems_mask length mismatch: expected {}, got {}",
+            max_ems,
+            ems_valid.len()
+        );
+    }
+
+    Ok(BinPackObsView {
+        items,
+        ems,
+        items_valid,
+        ems_valid,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -81,8 +149,15 @@ pub struct Rollout {
     n: usize,
     obs_dim: usize,
     _action_dim: usize,
+    max_items: usize,
+    max_ems: usize,
+    is_binpack: bool,
 
     obs: Vec<f32>,
+    items: Vec<f32>,
+    ems: Vec<f32>,
+    items_valid: Vec<u8>,
+    ems_valid: Vec<u8>,
     actions: Vec<i32>,
     old_logp: Vec<f32>,
     values: Vec<f32>,
@@ -103,7 +178,41 @@ impl Rollout {
             n,
             obs_dim,
             _action_dim: action_dim,
+            max_items: 0,
+            max_ems: 0,
+            is_binpack: false,
             obs: vec![0.0; num_samples * obs_dim],
+            items: vec![],
+            ems: vec![],
+            items_valid: vec![],
+            ems_valid: vec![],
+            actions: vec![0; num_samples],
+            old_logp: vec![0.0; num_samples],
+            values: vec![0.0; num_samples],
+            rewards: vec![0.0; num_samples],
+            dones: vec![0; num_samples],
+            masks: PackedMasks::new(action_dim, num_samples),
+            advantages: vec![0.0; num_samples],
+            targets: vec![0.0; num_samples],
+            adv_stats: AdvantageStats::default(),
+        }
+    }
+
+    pub fn new_binpack(t: usize, n: usize, max_items: usize, max_ems: usize, action_dim: usize) -> Self {
+        let num_samples = t * n;
+        Self {
+            t,
+            n,
+            obs_dim: 0,
+            _action_dim: action_dim,
+            max_items,
+            max_ems,
+            is_binpack: true,
+            obs: vec![],
+            items: vec![0.0; num_samples * max_items * 3],
+            ems: vec![0.0; num_samples * max_ems * 6],
+            items_valid: vec![0; num_samples * max_items],
+            ems_valid: vec![0; num_samples * max_ems],
             actions: vec![0; num_samples],
             old_logp: vec![0.0; num_samples],
             values: vec![0.0; num_samples],
@@ -145,6 +254,49 @@ impl Rollout {
         self.values[i] = value;
         self.rewards[i] = reward;
         self.dones[i] = if done { 1 } else { 0 };
+    }
+
+    pub fn store_step_binpack(
+        &mut self,
+        t: usize,
+        env: usize,
+        obs: &GenericObs,
+        mask: &[bool],
+        action: i32,
+        logp: f32,
+        value: f32,
+        reward: f32,
+        done: bool,
+    ) -> Result<()> {
+        if !self.is_binpack {
+            bail!("store_step_binpack called on non-binpack rollout");
+        }
+        let i = self.idx(t, env);
+        let parsed = parse_binpack_obs(obs, self.max_items, self.max_ems)?;
+
+        let items_base = i * self.max_items * 3;
+        self.items[items_base..items_base + self.max_items * 3].copy_from_slice(&parsed.items);
+
+        let ems_base = i * self.max_ems * 6;
+        self.ems[ems_base..ems_base + self.max_ems * 6].copy_from_slice(&parsed.ems);
+
+        let item_mask_base = i * self.max_items;
+        for (offset, valid) in parsed.items_valid.iter().enumerate() {
+            self.items_valid[item_mask_base + offset] = if *valid { 1 } else { 0 };
+        }
+
+        let ems_mask_base = i * self.max_ems;
+        for (offset, valid) in parsed.ems_valid.iter().enumerate() {
+            self.ems_valid[ems_mask_base + offset] = if *valid { 1 } else { 0 };
+        }
+
+        self.masks.set_mask(i, mask);
+        self.actions[i] = action;
+        self.old_logp[i] = logp;
+        self.values[i] = value;
+        self.rewards[i] = reward;
+        self.dones[i] = if done { 1 } else { 0 };
+        Ok(())
     }
 
     pub fn compute_gae(
@@ -241,5 +393,83 @@ impl Rollout {
         }
 
         (obs_mb, act_mb, mask_mb, old_lp_mb, old_v_mb, adv_mb, tgt_mb)
+    }
+
+    pub fn minibatch_binpack(
+        &self,
+        indices: &[usize],
+    ) -> Result<(
+        Vec<f32>,
+        Vec<f32>,
+        Vec<bool>,
+        Vec<bool>,
+        Vec<i32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    )> {
+        if !self.is_binpack {
+            bail!("minibatch_binpack called on non-binpack rollout");
+        }
+
+        let bsz = indices.len();
+        let mut items_mb = vec![0.0f32; bsz * self.max_items * 3];
+        let mut ems_mb = vec![0.0f32; bsz * self.max_ems * 6];
+        let mut items_mask_mb = vec![false; bsz * self.max_items];
+        let mut ems_mask_mb = vec![false; bsz * self.max_ems];
+        let mut act_mb = vec![0i32; bsz];
+        let mut mask_mb = vec![0.0f32; bsz * self._action_dim];
+        let mut old_lp_mb = vec![0.0f32; bsz];
+        let mut old_v_mb = vec![0.0f32; bsz];
+        let mut adv_mb = vec![0.0f32; bsz];
+        let mut tgt_mb = vec![0.0f32; bsz];
+
+        let unpacked_mask_mb = self.masks.unpack_to_f32(indices);
+        mask_mb.copy_from_slice(&unpacked_mask_mb);
+
+        for (row, &idx) in indices.iter().enumerate() {
+            let src_items = idx * self.max_items * 3;
+            let dst_items = row * self.max_items * 3;
+            items_mb[dst_items..dst_items + self.max_items * 3]
+                .copy_from_slice(&self.items[src_items..src_items + self.max_items * 3]);
+
+            let src_ems = idx * self.max_ems * 6;
+            let dst_ems = row * self.max_ems * 6;
+            ems_mb[dst_ems..dst_ems + self.max_ems * 6]
+                .copy_from_slice(&self.ems[src_ems..src_ems + self.max_ems * 6]);
+
+            let src_item_mask = idx * self.max_items;
+            let dst_item_mask = row * self.max_items;
+            for j in 0..self.max_items {
+                items_mask_mb[dst_item_mask + j] = self.items_valid[src_item_mask + j] != 0;
+            }
+
+            let src_ems_mask = idx * self.max_ems;
+            let dst_ems_mask = row * self.max_ems;
+            for j in 0..self.max_ems {
+                ems_mask_mb[dst_ems_mask + j] = self.ems_valid[src_ems_mask + j] != 0;
+            }
+
+            act_mb[row] = self.actions[idx];
+            old_lp_mb[row] = self.old_logp[idx];
+            old_v_mb[row] = self.values[idx];
+            adv_mb[row] = self.advantages[idx];
+            tgt_mb[row] = self.targets[idx];
+        }
+
+        Ok((
+            items_mb,
+            ems_mb,
+            items_mask_mb,
+            ems_mask_mb,
+            act_mb,
+            mask_mb,
+            old_lp_mb,
+            old_v_mb,
+            adv_mb,
+            tgt_mb,
+        ))
     }
 }

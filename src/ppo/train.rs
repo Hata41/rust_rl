@@ -4,18 +4,74 @@ use burn::collective::{finish_collective, PeerId, ReduceOperation};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{ElementConversion, Tensor, TensorData};
+use burn::tensor::{Bool, ElementConversion, Tensor, TensorData};
 use burn::tensor::Int;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use std::time::Instant;
 use tracing::{debug, info, span, Level};
+use rustpool::core::types::GenericObs;
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
 use crate::models::{Actor, Agent, Critic};
-use crate::ppo::buffer::{flatten_obs, Rollout};
+use crate::ppo::buffer::{flatten_obs, parse_binpack_obs, Rollout};
 use crate::ppo::loss::{compute_ppo_losses, logprob_and_entropy, sample_actions_gumbel};
+
+fn build_binpack_batch_tensors<B: AutodiffBackend>(
+    obs_batch: &[GenericObs],
+    max_items: usize,
+    max_ems: usize,
+    device: &B::Device,
+) -> Result<(
+    Tensor<B, 3>,
+    Tensor<B, 3>,
+    Tensor<B, 2, Bool>,
+    Tensor<B, 2, Bool>,
+    Tensor<B, 2>,
+    Tensor<B, 2>,
+)> {
+    let batch = obs_batch.len();
+    let mut items = vec![0.0f32; batch * max_items * 3];
+    let mut ems = vec![0.0f32; batch * max_ems * 6];
+    let mut items_pad = vec![false; batch * max_items];
+    let mut ems_pad = vec![false; batch * max_ems];
+    let mut items_valid_f32 = vec![0.0f32; batch * max_items];
+    let mut ems_valid_f32 = vec![0.0f32; batch * max_ems];
+
+    for (row, obs) in obs_batch.iter().enumerate() {
+        let parsed = parse_binpack_obs(obs, max_items, max_ems)?;
+
+        let item_base = row * max_items * 3;
+        items[item_base..item_base + max_items * 3].copy_from_slice(&parsed.items);
+
+        let ems_base = row * max_ems * 6;
+        ems[ems_base..ems_base + max_ems * 6].copy_from_slice(&parsed.ems);
+
+        let item_mask_base = row * max_items;
+        for i in 0..max_items {
+            let valid = parsed.items_valid[i];
+            items_pad[item_mask_base + i] = !valid;
+            items_valid_f32[item_mask_base + i] = if valid { 1.0 } else { 0.0 };
+        }
+
+        let ems_mask_base = row * max_ems;
+        for i in 0..max_ems {
+            let valid = parsed.ems_valid[i];
+            ems_pad[ems_mask_base + i] = !valid;
+            ems_valid_f32[ems_mask_base + i] = if valid { 1.0 } else { 0.0 };
+        }
+    }
+
+    let items_t = Tensor::<B, 3>::from_data(TensorData::new(items, [batch, max_items, 3]), device);
+    let ems_t = Tensor::<B, 3>::from_data(TensorData::new(ems, [batch, max_ems, 6]), device);
+    let items_pad_t = Tensor::<B, 2, Bool>::from_data(TensorData::new(items_pad, [batch, max_items]), device);
+    let ems_pad_t = Tensor::<B, 2, Bool>::from_data(TensorData::new(ems_pad, [batch, max_ems]), device);
+    let items_valid_t = Tensor::<B, 2>::from_data(TensorData::new(items_valid_f32, [batch, max_items]), device);
+    let ems_valid_t = Tensor::<B, 2>::from_data(TensorData::new(ems_valid_f32, [batch, max_ems]), device);
+
+    Ok((items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t))
+}
 
 fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
     if num_updates == 0 {
@@ -145,8 +201,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         .map(|s| s.action_mask.clone())
         .collect::<Vec<_>>();
 
-    let obs0 = flatten_obs(&cur_obs[0]);
-    let obs_dim = obs0.len();
+    let is_binpack = args.task_id == "BinPack-v0";
+
+    let obs_dim = if is_binpack {
+        args.max_items * 3 + args.max_ems * 6
+    } else {
+        flatten_obs(&cur_obs[0]).len()
+    };
     let action_dim = cur_mask[0].len();
 
     if is_lead {
@@ -195,7 +256,17 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let current_actor_lr = args.actor_lr * alpha;
         let current_critic_lr = args.critic_lr * alpha;
 
-        let mut roll = Rollout::new(args.rollout_length, local_num_envs, obs_dim, action_dim);
+        let mut roll = if is_binpack {
+            Rollout::new_binpack(
+                args.rollout_length,
+                local_num_envs,
+                args.max_items,
+                args.max_ems,
+                action_dim,
+            )
+        } else {
+            Rollout::new(args.rollout_length, local_num_envs, obs_dim, action_dim)
+        };
 
         let rollout_started = Instant::now();
         {
@@ -209,17 +280,6 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let _rollout_guard = rollout_span.enter();
 
             for t in 0..args.rollout_length {
-                let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
-                for e in 0..local_num_envs {
-                    let flat = flatten_obs(&cur_obs[e]);
-                    let base = e * obs_dim;
-                    obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
-                }
-                let obs_t = Tensor::<B, 2>::from_data(
-                    TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
-                    &device,
-                );
-
                 let mut mask_f = vec![0.0f32; local_num_envs * action_dim];
                 for e in 0..local_num_envs {
                     let row = e * action_dim;
@@ -232,8 +292,35 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     &device,
                 );
 
-                let logits = agent.actor.forward(obs_t.clone()).detach();
-                let values2 = agent.critic.forward(obs_t).detach();
+                let (logits, values2) = if is_binpack {
+                    let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
+                        build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
+
+                    let logits = agent
+                        .actor
+                        .forward_binpack(ems_t.clone(), items_t.clone(), ems_pad_t.clone(), items_pad_t.clone())
+                        .detach();
+                    let values2 = agent
+                        .critic
+                        .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t)
+                        .detach();
+                    (logits, values2)
+                } else {
+                    let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
+                    for e in 0..local_num_envs {
+                        let flat = flatten_obs(&cur_obs[e]);
+                        let base = e * obs_dim;
+                        obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
+                    }
+                    let obs_t = Tensor::<B, 2>::from_data(
+                        TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
+                        &device,
+                    );
+
+                    let logits = agent.actor.forward(obs_t.clone()).detach();
+                    let values2 = agent.critic.forward(obs_t).detach();
+                    (logits, values2)
+                };
                 let values = values2.reshape([local_num_envs]);
 
                 let actions_t = sample_actions_gumbel::<B>(logits.clone(), mask_t.clone(), &device);
@@ -256,19 +343,32 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 let step_out = env_pool.step_all(&actions_vec)?;
 
                 for e in 0..local_num_envs {
-                    let obs_flat = flatten_obs(&cur_obs[e]);
-
-                    roll.store_step(
-                        t,
-                        e,
-                        &obs_flat,
-                        &cur_mask[e],
-                        actions_vec[e],
-                        logp_vec[e],
-                        values_vec[e],
-                        step_out[e].reward,
-                        step_out[e].done,
-                    );
+                    if is_binpack {
+                        roll.store_step_binpack(
+                            t,
+                            e,
+                            &cur_obs[e],
+                            &cur_mask[e],
+                            actions_vec[e],
+                            logp_vec[e],
+                            values_vec[e],
+                            step_out[e].reward,
+                            step_out[e].done,
+                        )?;
+                    } else {
+                        let obs_flat = flatten_obs(&cur_obs[e]);
+                        roll.store_step(
+                            t,
+                            e,
+                            &obs_flat,
+                            &cur_mask[e],
+                            actions_vec[e],
+                            logp_vec[e],
+                            values_vec[e],
+                            step_out[e].reward,
+                            step_out[e].done,
+                        );
+                    }
 
                     ep_return[e] += step_out[e].reward;
                     ep_len[e] += 1;
@@ -288,17 +388,26 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         }
         let rollout_elapsed = rollout_started.elapsed();
 
-        let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
-        for e in 0..local_num_envs {
-            let flat = flatten_obs(&cur_obs[e]);
-            let base = e * obs_dim;
-            obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
-        }
-        let obs_last = Tensor::<B, 2>::from_data(
-            TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
-            &device,
-        );
-        let last_v2 = agent.critic.forward(obs_last).detach();
+        let last_v2 = if is_binpack {
+            let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
+                build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
+            agent
+                .critic
+                .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t)
+                .detach()
+        } else {
+            let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
+            for e in 0..local_num_envs {
+                let flat = flatten_obs(&cur_obs[e]);
+                let base = e * obs_dim;
+                obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
+            }
+            let obs_last = Tensor::<B, 2>::from_data(
+                TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
+                &device,
+            );
+            agent.critic.forward(obs_last).detach()
+        };
         let last_v = last_v2.reshape([local_num_envs]);
         let last_values: Vec<f32> = last_v.to_data().to_vec().unwrap();
 
@@ -338,40 +447,134 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let end = start + mb_size;
                     let mb_idx = &all_indices[start..end];
 
-                    let (obs_mb, act_mb, mask_mb, old_lp_mb, old_v_mb, adv_mb, tgt_mb) =
-                        roll.minibatch(mb_idx);
+                    let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack {
+                        let (
+                            items_mb,
+                            ems_mb,
+                            items_valid_mb,
+                            ems_valid_mb,
+                            act_mb,
+                            mask_mb,
+                            old_lp_mb,
+                            old_v_mb,
+                            adv_mb,
+                            tgt_mb,
+                        ) = roll.minibatch_binpack(mb_idx)?;
 
-                    let obs_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(obs_mb, [mb_size, obs_dim]),
-                        &device,
-                    );
-                    let act_t = Tensor::<B, 1, Int>::from_data(
-                        TensorData::new(act_mb, [mb_size]),
-                        &device,
-                    );
-                    let mask_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(mask_mb, [mb_size, action_dim]),
-                        &device,
-                    );
-                    let old_lp_t = Tensor::<B, 1>::from_data(
-                        TensorData::new(old_lp_mb, [mb_size]),
-                        &device,
-                    );
-                    let old_v_t = Tensor::<B, 1>::from_data(
-                        TensorData::new(old_v_mb, [mb_size]),
-                        &device,
-                    );
-                    let adv_t = Tensor::<B, 1>::from_data(
-                        TensorData::new(adv_mb, [mb_size]),
-                        &device,
-                    );
-                    let tgt_t = Tensor::<B, 1>::from_data(
-                        TensorData::new(tgt_mb, [mb_size]),
-                        &device,
-                    );
+                        let items_t = Tensor::<B, 3>::from_data(
+                            TensorData::new(items_mb, [mb_size, args.max_items, 3]),
+                            &device,
+                        );
+                        let ems_t = Tensor::<B, 3>::from_data(
+                            TensorData::new(ems_mb, [mb_size, args.max_ems, 6]),
+                            &device,
+                        );
 
-                    let logits = agent.actor.forward(obs_t.clone());
-                    let v2 = agent.critic.forward(obs_t);
+                        let mut items_pad_mb = vec![false; mb_size * args.max_items];
+                        let mut ems_pad_mb = vec![false; mb_size * args.max_ems];
+                        let mut items_valid_f32_mb = vec![0.0f32; mb_size * args.max_items];
+                        let mut ems_valid_f32_mb = vec![0.0f32; mb_size * args.max_ems];
+
+                        for i in 0..(mb_size * args.max_items) {
+                            let valid = items_valid_mb[i];
+                            items_pad_mb[i] = !valid;
+                            items_valid_f32_mb[i] = if valid { 1.0 } else { 0.0 };
+                        }
+                        for i in 0..(mb_size * args.max_ems) {
+                            let valid = ems_valid_mb[i];
+                            ems_pad_mb[i] = !valid;
+                            ems_valid_f32_mb[i] = if valid { 1.0 } else { 0.0 };
+                        }
+
+                        let items_pad_t = Tensor::<B, 2, Bool>::from_data(
+                            TensorData::new(items_pad_mb, [mb_size, args.max_items]),
+                            &device,
+                        );
+                        let ems_pad_t = Tensor::<B, 2, Bool>::from_data(
+                            TensorData::new(ems_pad_mb, [mb_size, args.max_ems]),
+                            &device,
+                        );
+                        let items_valid_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(items_valid_f32_mb, [mb_size, args.max_items]),
+                            &device,
+                        );
+                        let ems_valid_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(ems_valid_f32_mb, [mb_size, args.max_ems]),
+                            &device,
+                        );
+
+                        let logits = agent
+                            .actor
+                            .forward_binpack(ems_t.clone(), items_t.clone(), ems_pad_t.clone(), items_pad_t.clone());
+                        let v2 = agent
+                            .critic
+                            .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t);
+
+                        let act_t = Tensor::<B, 1, Int>::from_data(
+                            TensorData::new(act_mb, [mb_size]),
+                            &device,
+                        );
+                        let mask_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(mask_mb, [mb_size, action_dim]),
+                            &device,
+                        );
+                        let old_lp_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_lp_mb, [mb_size]),
+                            &device,
+                        );
+                        let old_v_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_v_mb, [mb_size]),
+                            &device,
+                        );
+                        let adv_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(adv_mb, [mb_size]),
+                            &device,
+                        );
+                        let tgt_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(tgt_mb, [mb_size]),
+                            &device,
+                        );
+
+                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
+                    } else {
+                        let (obs_mb, act_mb, mask_mb, old_lp_mb, old_v_mb, adv_mb, tgt_mb) =
+                            roll.minibatch(mb_idx);
+
+                        let obs_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(obs_mb, [mb_size, obs_dim]),
+                            &device,
+                        );
+                        let act_t = Tensor::<B, 1, Int>::from_data(
+                            TensorData::new(act_mb, [mb_size]),
+                            &device,
+                        );
+                        let mask_t = Tensor::<B, 2>::from_data(
+                            TensorData::new(mask_mb, [mb_size, action_dim]),
+                            &device,
+                        );
+                        let old_lp_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_lp_mb, [mb_size]),
+                            &device,
+                        );
+                        let old_v_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(old_v_mb, [mb_size]),
+                            &device,
+                        );
+                        let adv_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(adv_mb, [mb_size]),
+                            &device,
+                        );
+                        let tgt_t = Tensor::<B, 1>::from_data(
+                            TensorData::new(tgt_mb, [mb_size]),
+                            &device,
+                        );
+
+                        let logits = agent.actor.forward(obs_t.clone());
+                        let v2 = agent.critic.forward(obs_t);
+
+                        (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
+                    };
+
                     let v = v2.reshape([mb_size]);
 
                     let (new_lp, ent) = logprob_and_entropy::<B>(logits, mask_t, act_t);
