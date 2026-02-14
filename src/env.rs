@@ -143,9 +143,9 @@ impl AsyncEnvPool {
             bail!("actions length must match num_envs");
         }
 
-        for env_id in 0..self.num_envs {
+        for (env_id, action) in actions.iter().enumerate() {
             self.route_tx(env_id)
-                .send(WorkerAction::Step(env_id, actions[env_id]))
+                .send(WorkerAction::Step(env_id, *action))
                 .context("failed to send step")?;
         }
 

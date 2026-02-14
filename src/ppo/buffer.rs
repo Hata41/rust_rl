@@ -3,7 +3,15 @@ use bitvec::prelude::*;
 use rustpool::core::types::{ArrayData, GenericObs};
 
 pub fn flatten_obs(obs: &GenericObs) -> Vec<f32> {
-    let mut out = Vec::new();
+    let capacity = obs
+        .iter()
+        .map(|a| match a {
+            ArrayData::Float32(v) => v.len(),
+            ArrayData::Int32(v) => v.len(),
+            ArrayData::Bool(v) => v.len(),
+        })
+        .sum();
+    let mut out = Vec::with_capacity(capacity);
     for a in obs {
         match a {
             ArrayData::Float32(v) => out.extend_from_slice(v),
@@ -15,32 +23,36 @@ pub fn flatten_obs(obs: &GenericObs) -> Vec<f32> {
 }
 
 #[derive(Clone, Debug)]
-pub struct BinPackObsView {
-    pub items: Vec<f32>,
-    pub ems: Vec<f32>,
-    pub items_valid: Vec<bool>,
-    pub ems_valid: Vec<bool>,
+pub struct BinPackObsView<'a> {
+    pub items: &'a [f32],
+    pub ems: &'a [f32],
+    pub items_valid: &'a [bool],
+    pub ems_valid: &'a [bool],
 }
 
-pub fn parse_binpack_obs(obs: &GenericObs, max_items: usize, max_ems: usize) -> Result<BinPackObsView> {
+pub fn parse_binpack_obs(
+    obs: &GenericObs,
+    max_items: usize,
+    max_ems: usize,
+) -> Result<BinPackObsView<'_>> {
     if obs.len() < 5 {
         bail!("binpack obs must have at least 5 entries, got {}", obs.len());
     }
 
     let items = match &obs[0] {
-        ArrayData::Float32(v) => v.clone(),
+        ArrayData::Float32(v) => v.as_slice(),
         _ => bail!("binpack items must be Float32"),
     };
     let ems = match &obs[1] {
-        ArrayData::Float32(v) => v.clone(),
+        ArrayData::Float32(v) => v.as_slice(),
         _ => bail!("binpack ems must be Float32"),
     };
     let items_valid = match &obs[2] {
-        ArrayData::Bool(v) => v.clone(),
+        ArrayData::Bool(v) => v.as_slice(),
         _ => bail!("binpack items_mask must be Bool"),
     };
     let ems_valid = match &obs[4] {
-        ArrayData::Bool(v) => v.clone(),
+        ArrayData::Bool(v) => v.as_slice(),
         _ => bail!("binpack ems_mask must be Bool"),
     };
 
@@ -253,7 +265,7 @@ impl Rollout {
         self.old_logp[i] = logp;
         self.values[i] = value;
         self.rewards[i] = reward;
-        self.dones[i] = if done { 1 } else { 0 };
+        self.dones[i] = u8::from(done);
     }
 
     pub fn store_step_binpack(
@@ -282,12 +294,12 @@ impl Rollout {
 
         let item_mask_base = i * self.max_items;
         for (offset, valid) in parsed.items_valid.iter().enumerate() {
-            self.items_valid[item_mask_base + offset] = if *valid { 1 } else { 0 };
+            self.items_valid[item_mask_base + offset] = u8::from(*valid);
         }
 
         let ems_mask_base = i * self.max_ems;
         for (offset, valid) in parsed.ems_valid.iter().enumerate() {
-            self.ems_valid[ems_mask_base + offset] = if *valid { 1 } else { 0 };
+            self.ems_valid[ems_mask_base + offset] = u8::from(*valid);
         }
 
         self.masks.set_mask(i, mask);
@@ -295,7 +307,7 @@ impl Rollout {
         self.old_logp[i] = logp;
         self.values[i] = value;
         self.rewards[i] = reward;
-        self.dones[i] = if done { 1 } else { 0 };
+        self.dones[i] = u8::from(done);
         Ok(())
     }
 
@@ -420,14 +432,11 @@ impl Rollout {
         let mut items_mask_mb = vec![false; bsz * self.max_items];
         let mut ems_mask_mb = vec![false; bsz * self.max_ems];
         let mut act_mb = vec![0i32; bsz];
-        let mut mask_mb = vec![0.0f32; bsz * self._action_dim];
+        let mask_mb = self.masks.unpack_to_f32(indices);
         let mut old_lp_mb = vec![0.0f32; bsz];
         let mut old_v_mb = vec![0.0f32; bsz];
         let mut adv_mb = vec![0.0f32; bsz];
         let mut tgt_mb = vec![0.0f32; bsz];
-
-        let unpacked_mask_mb = self.masks.unpack_to_f32(indices);
-        mask_mb.copy_from_slice(&unpacked_mask_mb);
 
         for (row, &idx) in indices.iter().enumerate() {
             let src_items = idx * self.max_items * 3;

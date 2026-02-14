@@ -9,6 +9,7 @@ use burn::tensor::Int;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::time::Instant;
 use tracing::{debug, info, span, Level};
 use rustpool::core::types::GenericObs;
@@ -279,8 +280,8 @@ fn run_deterministic_eval<B: AutodiffBackend>(
         }
 
         for e in 0..num_eval_envs {
-            cur_obs[e] = step_out[e].obs.clone();
-            cur_mask[e] = step_out[e].action_mask.clone();
+            cur_obs[e].clone_from(&step_out[e].obs);
+            cur_mask[e].clone_from(&step_out[e].action_mask);
         }
     }
 
@@ -389,8 +390,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
     let mut ep_return = vec![0.0f32; local_num_envs];
     let mut ep_len = vec![0usize; local_num_envs];
-    let mut recent_returns: Vec<f32> = Vec::with_capacity(256);
-    let mut recent_lengths: Vec<usize> = Vec::with_capacity(256);
+    let recent_window = 100usize;
+    let mut recent_returns: VecDeque<f32> = VecDeque::with_capacity(recent_window);
+    let mut recent_lengths: VecDeque<usize> = VecDeque::with_capacity(recent_window);
 
     let mut rng = StdRng::seed_from_u64(args.seed ^ 0xA11CE);
 
@@ -438,6 +440,11 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         } else {
             Rollout::new(args.rollout_length, local_num_envs, obs_dim, action_dim)
         };
+        let mut obs_flat_all = if is_binpack {
+            Vec::new()
+        } else {
+            vec![0.0f32; local_num_envs * obs_dim]
+        };
 
         let rollout_started = Instant::now();
         {
@@ -477,14 +484,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         .detach();
                     (logits, values2)
                 } else {
-                    let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
                     for e in 0..local_num_envs {
                         let flat = flatten_obs(&cur_obs[e]);
                         let base = e * obs_dim;
                         obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
                     }
                     let obs_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
+                        TensorData::new(obs_flat_all.clone(), [local_num_envs, obs_dim]),
                         &device,
                     );
 
@@ -527,11 +533,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             step_out[e].done,
                         )?;
                     } else {
-                        let obs_flat = flatten_obs(&cur_obs[e]);
+                        let base = e * obs_dim;
+                        let obs_flat = &obs_flat_all[base..base + obs_dim];
                         roll.store_step(
                             t,
                             e,
-                            &obs_flat,
+                            obs_flat,
                             &cur_mask[e],
                             actions_vec[e],
                             logp_vec[e],
@@ -544,16 +551,30 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     ep_return[e] += step_out[e].reward;
                     ep_len[e] += 1;
                     if step_out[e].done {
-                        recent_returns.push(ep_return[e]);
-                        recent_lengths.push(ep_len[e]);
+                        recent_returns.push_back(ep_return[e]);
+                        if recent_returns.len() > recent_window {
+                            recent_returns.pop_front();
+                        }
+                        recent_lengths.push_back(ep_len[e]);
+                        if recent_lengths.len() > recent_window {
+                            recent_lengths.pop_front();
+                        }
                         ep_return[e] = 0.0;
                         ep_len[e] = 0;
                     }
                 }
 
                 for e in 0..local_num_envs {
-                    cur_obs[e] = step_out[e].obs.clone();
-                    cur_mask[e] = step_out[e].action_mask.clone();
+                    cur_obs[e].clone_from(&step_out[e].obs);
+                    cur_mask[e].clone_from(&step_out[e].action_mask);
+                }
+            }
+
+            if !is_binpack {
+                for e in 0..local_num_envs {
+                    let flat = flatten_obs(&cur_obs[e]);
+                    let base = e * obs_dim;
+                    obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
                 }
             }
         }
@@ -567,12 +588,6 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t)
                 .detach()
         } else {
-            let mut obs_flat_all = vec![0.0f32; local_num_envs * obs_dim];
-            for e in 0..local_num_envs {
-                let flat = flatten_obs(&cur_obs[e]);
-                let base = e * obs_dim;
-                obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
-            }
             let obs_last = Tensor::<B, 2>::from_data(
                 TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
                 &device,
@@ -850,14 +865,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let mean_return = if recent_returns.is_empty() {
                 0.0
             } else {
-                let k = recent_returns.len().min(100);
-                recent_returns[recent_returns.len() - k..].iter().sum::<f32>() / (k as f32)
+                recent_returns.iter().copied().sum::<f32>() / (recent_returns.len() as f32)
             };
             let max_return = if recent_returns.is_empty() {
                 0.0
             } else {
-                let k = recent_returns.len().min(100);
-                recent_returns[recent_returns.len() - k..]
+                recent_returns
                     .iter()
                     .copied()
                     .fold(f32::NEG_INFINITY, f32::max)
@@ -865,8 +878,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let min_return = if recent_returns.is_empty() {
                 0.0
             } else {
-                let k = recent_returns.len().min(100);
-                recent_returns[recent_returns.len() - k..]
+                recent_returns
                     .iter()
                     .copied()
                     .fold(f32::INFINITY, f32::min)
@@ -874,30 +886,21 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let mean_ep_len = if recent_lengths.is_empty() {
                 0.0
             } else {
-                let k = recent_lengths.len().min(100);
-                recent_lengths[recent_lengths.len() - k..]
+                recent_lengths
                     .iter()
                     .map(|v| *v as f32)
                     .sum::<f32>()
-                    / (k as f32)
+                    / (recent_lengths.len() as f32)
             };
             let max_ep_len = if recent_lengths.is_empty() {
                 0
             } else {
-                let k = recent_lengths.len().min(100);
-                *recent_lengths[recent_lengths.len() - k..]
-                    .iter()
-                    .max()
-                    .unwrap_or(&0)
+                recent_lengths.iter().copied().max().unwrap_or(0)
             };
             let min_ep_len = if recent_lengths.is_empty() {
                 0
             } else {
-                let k = recent_lengths.len().min(100);
-                *recent_lengths[recent_lengths.len() - k..]
-                    .iter()
-                    .min()
-                    .unwrap_or(&0)
+                recent_lengths.iter().copied().min().unwrap_or(0)
             };
 
             let adv_stats = roll.advantage_stats();
