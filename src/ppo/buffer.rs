@@ -13,6 +13,31 @@ pub fn flatten_obs(obs: &GenericObs) -> Vec<f32> {
     out
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdvantageStats {
+    pub pre_mean: f32,
+    pub pre_std: f32,
+    pub post_mean: f32,
+    pub post_std: f32,
+}
+
+fn mean_std(values: &[f32]) -> (f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = values.len() as f32;
+    let mean = values.iter().sum::<f32>() / n;
+    let var = values
+        .iter()
+        .map(|v| {
+            let d = *v - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / n;
+    (mean, var.sqrt())
+}
+
 #[derive(Clone)]
 pub struct PackedMasks {
     action_dim: usize,
@@ -67,6 +92,7 @@ pub struct Rollout {
 
     advantages: Vec<f32>,
     targets: Vec<f32>,
+    adv_stats: AdvantageStats,
 }
 
 impl Rollout {
@@ -86,6 +112,7 @@ impl Rollout {
             masks: PackedMasks::new(action_dim, num_samples),
             advantages: vec![0.0; num_samples],
             targets: vec![0.0; num_samples],
+            adv_stats: AdvantageStats::default(),
         }
     }
 
@@ -150,6 +177,8 @@ impl Rollout {
             }
         }
 
+        let (pre_mean, pre_std) = mean_std(&self.advantages);
+
         if standardize {
             let n = (self.t * self.n) as f32;
             let mean = self.advantages.iter().sum::<f32>() / n;
@@ -168,6 +197,18 @@ impl Rollout {
                 *a = (*a - mean) / std;
             }
         }
+
+        let (post_mean, post_std) = mean_std(&self.advantages);
+        self.adv_stats = AdvantageStats {
+            pre_mean,
+            pre_std,
+            post_mean,
+            post_std,
+        };
+    }
+
+    pub fn advantage_stats(&self) -> AdvantageStats {
+        self.adv_stats
     }
 
     pub fn minibatch(
