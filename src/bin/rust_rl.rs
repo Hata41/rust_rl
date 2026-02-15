@@ -6,7 +6,7 @@ use burn_ndarray::{NdArray, NdArrayDevice};
 use tracing_subscriber::EnvFilter;
 
 use rust_rl::config::{Args, DeviceType, DistInfo};
-use rust_rl::spo::train;
+use rust_rl::ppo::train;
 use rust_rl::telemetry::{DashboardFormatter, MetricRegistry};
 
 fn main() -> Result<()> {
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
             .with_line_number(false)
             .with_thread_ids(false)
             .with_thread_names(false)
-            .event_format(formatter)
+                .event_format(formatter)
             .try_init();
     }
 

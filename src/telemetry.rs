@@ -1,22 +1,13 @@
-use anyhow::{bail, Result};
-use burn::backend::autodiff::Autodiff;
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::collective::{register, CollectiveConfig, PeerId};
-use burn_ndarray::{NdArray, NdArrayDevice};
 use std::collections::HashMap;
 use std::fmt;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::registry::LookupSpan;
 
-use rust_ppo::config::{Args, DeviceType, DistInfo};
-use rust_ppo::ppo::train;
-
 #[derive(Default)]
-struct DashboardVisitor {
+pub struct DashboardVisitor {
     category: Option<String>,
     fields: Vec<(String, String)>,
 }
@@ -66,12 +57,12 @@ impl Visit for DashboardVisitor {
 }
 
 #[derive(Default, Clone)]
-struct MetricRegistry {
+pub struct MetricRegistry {
     labels: HashMap<String, String>,
 }
 
 impl MetricRegistry {
-    fn with_defaults() -> Self {
+    pub fn with_defaults() -> Self {
         let mut registry = Self::default();
         registry.register("global_grad_norm", "Grad norm");
         registry.register("steps_per_second", "Steps per second");
@@ -83,8 +74,8 @@ impl MetricRegistry {
         registry
     }
 
-    fn with_env_overrides(mut self) -> Self {
-        if let Ok(raw) = std::env::var("RUST_PPO_METRIC_LABELS") {
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(raw) = std::env::var("RUST_RL_METRIC_LABELS") {
             for entry in raw.split(',') {
                 let Some((key, label)) = entry.split_once('=') else {
                     continue;
@@ -99,21 +90,21 @@ impl MetricRegistry {
         self
     }
 
-    fn register(&mut self, key: impl Into<String>, label: impl Into<String>) {
+    pub fn register(&mut self, key: impl Into<String>, label: impl Into<String>) {
         self.labels.insert(key.into(), label.into());
     }
 
-    fn resolve(&self, key: &str) -> Option<&str> {
+    pub fn resolve(&self, key: &str) -> Option<&str> {
         self.labels.get(key).map(String::as_str)
     }
 }
 
-struct DashboardFormatter {
+pub struct DashboardFormatter {
     registry: MetricRegistry,
 }
 
 impl DashboardFormatter {
-    fn new(registry: MetricRegistry) -> Self {
+    pub fn new(registry: MetricRegistry) -> Self {
         Self { registry }
     }
 
@@ -184,59 +175,5 @@ where
         }
 
         writeln!(writer)
-    }
-}
-
-fn main() -> Result<()> {
-    let args = Args::load()?;
-    let dist = DistInfo::from_env_or_args(&args)?;
-
-    if dist.rank == 0 {
-        let formatter = DashboardFormatter::new(
-            MetricRegistry::with_defaults().with_env_overrides(),
-        );
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_level(false)
-            .without_time()
-            .with_file(false)
-            .with_line_number(false)
-            .with_thread_ids(false)
-            .with_thread_names(false)
-                .event_format(formatter)
-            .try_init();
-    }
-
-    match args.device_type {
-        DeviceType::Cpu => {
-            if dist.world_size > 1 {
-                bail!(
-                    "--device-type cpu does not support distributed training (WORLD_SIZE must be 1)"
-                );
-            }
-            train::run::<Autodiff<NdArray<f32>>>(args, dist, NdArrayDevice::Cpu)
-        }
-        DeviceType::Cuda => {
-            let device_index = if dist.world_size > 1 {
-                dist.local_rank
-            } else {
-                args.cuda_device
-            };
-            let device = CudaDevice::new(device_index);
-
-            if dist.world_size > 1 {
-                let peer_id = PeerId::from(dist.rank);
-                register::<Cuda<f32, i32>>(
-                    peer_id,
-                    device.clone(),
-                    CollectiveConfig::default().with_num_devices(dist.world_size),
-                )
-                .map_err(|e| anyhow::anyhow!("failed to register burn collective: {e:?}"))?;
-            }
-
-            train::run::<Autodiff<Cuda<f32, i32>>>(args, dist, device)
-        }
     }
 }

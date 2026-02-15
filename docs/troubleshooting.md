@@ -1,5 +1,7 @@
 # Troubleshooting
 
+This guide covers shared runtime contracts plus PPO/SPO-specific failure modes.
+
 ## One Strike Policy (invalid action contract)
 
 In this architecture, invalid actions terminate the current episode immediately.
@@ -53,6 +55,65 @@ Checks:
 - verify `max_items` and `max_ems` consistency across config and env constructor,
 - verify action dim equals `max_items * max_ems` for BinPack,
 - verify parsed masks/valid flags sizes in `parse_binpack_obs`.
+
+SPO-specific checks:
+
+- verify `root_action_weights` length matches `action_dim` for replay inserts,
+- verify eval and train both use consistent `EnvModelKind` path through `env_model` helpers,
+- verify search masks match actor output action space at each depth.
+
+## SPO replay warmup appears stuck
+
+Symptom:
+
+- SPO TRAINER logs appear but optimization losses stay near zero or do not update.
+
+Cause:
+
+- optimization is gated on replay warmup threshold (`sample_sequence_length * num_envs`).
+
+Checks:
+
+- confirm replay length grows each update,
+- reduce `sample_sequence_length` for smoke tests,
+- ensure rollout phase is executing and transitions are being appended.
+
+## Snapshot lifecycle and accounting regressions
+
+Symptoms:
+
+- memory growth in long search-heavy runs,
+- debug assertions or negative-live-counter style symptoms.
+
+Contract:
+
+- every state id produced by snapshot/simulate paths must be released,
+- `rust_rl` (`AsyncEnvPool`) owns active-id accounting,
+- `rustpool` `StateRegistry` remains storage backend and should not carry trainer accounting policy.
+
+Checks:
+
+- verify root ids are released after each search call,
+- verify leaf ids returned by search are released,
+- verify eval path also releases root/leaf simulated ids.
+
+## Telemetry mismatch between PPO and SPO
+
+Symptoms:
+
+- dashboards/parsers fail on SPO logs,
+- category names differ across binaries.
+
+Expected:
+
+- both binaries use shared formatter in `src/telemetry.rs`,
+- categories are `TRAINER`, `ACTOR`, `EVALUATOR`, `MISC`,
+- evaluation records use PPO-compatible key schema (`mean_return`, `episode_length_mean`, etc.).
+
+If mismatch appears:
+
+- verify both binaries initialize shared formatter,
+- verify log fields in trainer emitters were not renamed inconsistently.
 
 ## Distributed startup issues
 

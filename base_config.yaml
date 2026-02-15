@@ -1,6 +1,12 @@
-# Base configuration template for rust_ppo.
+# Base PPO-oriented profile template for rust_rl.
+# This file is not the canonical source of runtime defaults.
+# Runtime defaults are defined in src/config.rs.
 # Precedence order at runtime is:
 #   built-in defaults < values in this file < explicit CLI flags
+#
+# Shared schema note:
+# - canonical section name is `training_core`
+# - parser also accepts legacy alias `ppo_core` for compatibility
 
 environment:
   # rustpool task id (examples: "BinPack-v0", "Maze-v0")

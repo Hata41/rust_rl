@@ -1,4 +1,4 @@
-# rust_ppo
+# rust_rl
 
 High-throughput PPO training in Rust on top of `rustpool`, with support for `BinPack-v0` and `Maze-v0`.
 
@@ -12,7 +12,8 @@ This repository is documented for two goals:
 - [Onboarding](docs/onboarding.md)
 - [Architecture](docs/architecture.md)
 - [Configuration](docs/configuration.md)
-- [Training Loop](docs/training-loop.md)
+- [PPO Training Loop](docs/training-loop.md)
+- [SPO Training Loop](docs/spo-training-loop.md)
 - [Telemetry](docs/telemetry.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
@@ -87,7 +88,7 @@ WORLD_SIZE=2 RANK=1 LOCAL_RANK=1 cargo run --release -- --config base_config.yam
 
 Code pointers for execution path:
 
-- Entry and backend selection (`main`): [src/bin/rust_ppo.rs](src/bin/rust_ppo.rs#L190)
+- Entry and backend selection (`main`): [src/bin/rust_rl.rs](src/bin/rust_rl.rs#L190)
 - Config loading and precedence (`Args::load`): [src/config.rs](src/config.rs#L257)
 - Training orchestrator (`train::run`): [src/ppo/train.rs](src/ppo/train.rs#L325)
 - Environment pool + env factory (`AsyncEnvPool::new`, `make_env`): [src/env.rs](src/env.rs#L32), [src/env.rs](src/env.rs#L167)
@@ -103,8 +104,18 @@ If your priority is execution:
 If your priority is understanding how it works:
 
 1. [Architecture](docs/architecture.md)
-2. [Training Loop](docs/training-loop.md)
-3. [Telemetry](docs/telemetry.md)
+2. [PPO Training Loop](docs/training-loop.md)
+3. [SPO Training Loop](docs/spo-training-loop.md)
+4. [Telemetry](docs/telemetry.md)
+
+## Shared contracts
+
+Cross-cutting contracts to know before changing internals:
+
+- Shared schema merge and compatibility aliasing (`training_core` + legacy `ppo_core`): [Configuration](docs/configuration.md)
+- Shared env-model adapter used by PPO and SPO: [Architecture](docs/architecture.md)
+- Snapshot ownership boundary (`rust_rl` accounting, `rustpool` storage backend): [Architecture](docs/architecture.md)
+- Shared telemetry schema and categories for PPO/SPO: [Telemetry](docs/telemetry.md)
 
 ## Runtime model
 
@@ -116,6 +127,24 @@ Code pointers:
 
 - Arg merge and overrides (`apply_config_file`, `apply_cli_overrides`): [src/config.rs](src/config.rs#L294), [src/config.rs](src/config.rs#L341)
 - Distributed env resolution (`from_env_or_args`): [src/config.rs](src/config.rs#L414)
-- CPU/CUDA guardrails: [src/bin/rust_ppo.rs](src/bin/rust_ppo.rs#L211)
+- CPU/CUDA guardrails: [src/bin/rust_rl.rs](src/bin/rust_rl.rs#L211)
 
-For details, see [Configuration](docs/configuration.md) and [Training Loop](docs/training-loop.md).
+For details, see [Configuration](docs/configuration.md), [PPO Training Loop](docs/training-loop.md), and [SPO Training Loop](docs/spo-training-loop.md).
+
+## Recent updates
+
+Recent implementation and documentation changes are now reflected across PPO and SPO paths.
+
+- SPO logging now matches PPO style and cadence, including evaluation-phase schema compatibility (`TRAINER` / `ACTOR` / `EVALUATOR` / `MISC`).
+- Dashboard formatting and metric-label handling are shared in `src/telemetry.rs` and used by both binaries.
+- Shared config schema docs now include precedence, strict unknown-field behavior, and compatibility aliasing (`training_core` with legacy `ppo_core`).
+- SPO now has a dedicated runtime contract document at [docs/spo-training-loop.md](docs/spo-training-loop.md) at the same rigor level as PPO docs.
+- Crate boundary ownership is explicit: `rust_rl` owns snapshot lifecycle accounting policy, while `rustpool` remains snapshot storage backend.
+
+Suggested read order for these updates:
+
+1. [docs/configuration.md](docs/configuration.md)
+2. [docs/architecture.md](docs/architecture.md)
+3. [docs/telemetry.md](docs/telemetry.md)
+4. [docs/training-loop.md](docs/training-loop.md)
+5. [docs/spo-training-loop.md](docs/spo-training-loop.md)

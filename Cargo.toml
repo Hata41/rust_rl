@@ -1,12 +1,12 @@
 [package]
-name = "rust_ppo"
+name = "rust_rl"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "rust_ppo"
-path = "src/bin/rust_ppo.rs"
+name = "rust_rl"
+path = "src/bin/rust_rl.rs"
 
 [[bin]]
 name = "rust_spo"

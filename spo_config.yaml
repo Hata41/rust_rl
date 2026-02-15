@@ -1,6 +1,12 @@
-# SPO-focused configuration template for rust_spo.
+# SPO-oriented profile template for rust_spo.
+# This file is not the canonical source of runtime defaults.
+# Runtime defaults are defined in src/config.rs.
 # Precedence at runtime:
 #   built-in defaults < values in this file < explicit CLI flags
+#
+# Shared schema note:
+# - canonical section name is `training_core`
+# - parser also accepts legacy alias `ppo_core` for compatibility
 
 environment:
   task_id: "BinPack-v0"

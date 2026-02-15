@@ -11,7 +11,7 @@ pub enum DeviceType {
 }
 
 #[derive(Parser, Debug, Clone)]
-#[command(name = "rust_ppo")]
+#[command(name = "rust_rl")]
 pub struct Args {
     /// Optional YAML config file path.
     #[arg(long)]

@@ -6,7 +6,8 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::VecDeque;
-use tracing::info;
+use std::time::Instant;
+use tracing::{debug, info};
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
@@ -25,7 +26,17 @@ struct EvalStats {
     max_return: f32,
     min_return: f32,
     mean_ep_len: f32,
+    max_ep_len: usize,
+    min_ep_len: usize,
     episodes: usize,
+}
+
+fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
+    if num_updates == 0 {
+        return 1.0;
+    }
+    let progress = (update as f64) / (num_updates as f64);
+    1.0 - progress
 }
 
 fn greedy_actions_from_weights(root_action_weights: &[f32], batch: usize, action_dim: usize) -> Vec<i32> {
@@ -62,6 +73,8 @@ fn run_search_eval<B: AutodiffBackend>(
             max_return: 0.0,
             min_return: 0.0,
             mean_ep_len: 0.0,
+            max_ep_len: 0,
+            min_ep_len: 0,
             episodes: 0,
         });
     }
@@ -145,12 +158,16 @@ fn run_search_eval<B: AutodiffBackend>(
         .copied()
         .fold(f32::INFINITY, f32::min);
     let mean_ep_len = completed_lengths.iter().map(|v| *v as f32).sum::<f32>() / episodes as f32;
+    let max_ep_len = *completed_lengths.iter().max().unwrap_or(&0);
+    let min_ep_len = *completed_lengths.iter().min().unwrap_or(&0);
 
     Ok(EvalStats {
         mean_return,
         max_return,
         min_return,
         mean_ep_len,
+        max_ep_len,
+        min_ep_len,
         episodes,
     })
 }
@@ -246,22 +263,42 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     let mut critic_optim = AdamConfig::new().init::<B, crate::models::Critic<B>>();
     let mut dual_optim = AdamConfig::new().init::<B, MpoDuals<B>>();
     let mut rng = StdRng::seed_from_u64(args.seed + dist.rank as u64);
+    let mut ep_return = vec![0.0f32; args.num_envs];
+    let mut ep_len = vec![0usize; args.num_envs];
+    let recent_window = 100usize;
+    let mut recent_returns: VecDeque<f32> = VecDeque::with_capacity(recent_window);
+    let mut recent_lengths: VecDeque<usize> = VecDeque::with_capacity(recent_window);
 
-    if dist.rank == 0 {
+    if is_lead {
         info!(
-            category = "TRAINER",
-            mode = "spo",
-            num_envs = args.num_envs,
+            category = "MISC",
+            task = %args.task_id,
+            world_size = dist.world_size,
+            global_num_envs = args.num_envs * dist.world_size,
+            local_num_envs = args.num_envs,
+            rollout_length = args.rollout_length,
+            local_batch = args.rollout_length * args.num_envs,
+            obs_dim,
+            action_dim,
             num_particles = args.num_particles,
             search_depth = args.search_depth,
             replay_capacity = args.replay_buffer_size,
-            "initialized SPO trainer"
+            "startup"
         );
     }
 
     let mut cur_steps = reset;
     let env_ids = (0..args.num_envs).collect::<Vec<_>>();
     for update in 0..args.num_updates {
+        let alpha = if args.decay_learning_rates {
+            linear_decay_alpha(update, args.num_updates)
+        } else {
+            1.0
+        };
+        let current_actor_lr = args.actor_lr * alpha;
+        let current_critic_lr = args.critic_lr * alpha;
+
+        let rollout_started = Instant::now();
         for _ in 0..args.rollout_length {
             let cur_obs = cur_steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
             let cur_masks = cur_steps
@@ -300,6 +337,23 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             env_pool.release_batch(&search_out.leaf_state_ids);
 
             let next_steps = env_pool.step_all(&actions)?;
+            for env_idx in 0..args.num_envs {
+                ep_return[env_idx] += next_steps[env_idx].reward;
+                ep_len[env_idx] += 1;
+                if next_steps[env_idx].done {
+                    if recent_returns.len() >= recent_window {
+                        recent_returns.pop_front();
+                    }
+                    if recent_lengths.len() >= recent_window {
+                        recent_lengths.pop_front();
+                    }
+                    recent_returns.push_back(ep_return[env_idx]);
+                    recent_lengths.push_back(ep_len[env_idx]);
+                    ep_return[env_idx] = 0.0;
+                    ep_len[env_idx] = 0;
+                }
+            }
+
             for (env_idx, ((cur, nxt), action)) in cur_steps
                 .iter()
                 .zip(next_steps.iter())
@@ -321,9 +375,17 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
             cur_steps = next_steps;
         }
+        let rollout_elapsed = rollout_started.elapsed();
+
+        let optimization_started = Instant::now();
+        let mut actor_loss_sum = 0.0f64;
+        let mut critic_loss_sum = 0.0f64;
+        let mut temp_loss_sum = 0.0f64;
+        let mut alpha_loss_sum = 0.0f64;
+        let mut mpo_total_loss_sum = 0.0f64;
+        let mut optimization_updates = 0usize;
 
         if replay.len() >= args.sample_sequence_length * args.num_envs {
-            let mut last_mpo_total = 0.0f64;
             for _ in 0..args.epochs {
                 for _ in 0..args.num_minibatches {
                     let sampled = replay.sample_random(args.num_envs, &mut rng);
@@ -394,37 +456,157 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         );
                     let grads_duals = GradientsParams::from_module::<B, MpoDuals<B>>(&mut grads, &duals);
 
-                    agent_online.actor = actor_optim.step(args.actor_lr, agent_online.actor, grads_actor);
+                    agent_online.actor = actor_optim.step(current_actor_lr, agent_online.actor, grads_actor);
                     agent_online.critic =
-                        critic_optim.step(args.critic_lr, agent_online.critic, grads_critic);
+                        critic_optim.step(current_critic_lr, agent_online.critic, grads_critic);
                     duals = dual_optim.step(args.dual_lr, duals, grads_duals);
 
                     soft_update_params::<Agent<B>, B>(&mut agent_target, &agent_online, args.tau);
 
-                    last_mpo_total = parts
+                    let actor_loss = parts
+                        .actor_loss
+                        .to_data()
+                        .to_vec::<f32>()
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .unwrap_or(0.0) as f64;
+                    let critic_loss = parts
+                        .critic_loss
+                        .to_data()
+                        .to_vec::<f32>()
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .unwrap_or(0.0) as f64;
+                    let temp_loss = parts
+                        .loss_temperature
+                        .to_data()
+                        .to_vec::<f32>()
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .unwrap_or(0.0) as f64;
+                    let alpha_loss = parts
+                        .loss_alpha
+                        .to_data()
+                        .to_vec::<f32>()
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
+                        .unwrap_or(0.0) as f64;
+                    let mpo_total_loss = parts
                         .total_loss
                         .to_data()
                         .to_vec::<f32>()
                         .ok()
                         .and_then(|v| v.into_iter().next())
                         .unwrap_or(0.0) as f64;
+
+                    actor_loss_sum += actor_loss;
+                    critic_loss_sum += critic_loss;
+                    temp_loss_sum += temp_loss;
+                    alpha_loss_sum += alpha_loss;
+                    mpo_total_loss_sum += mpo_total_loss;
+                    optimization_updates += 1;
                 }
             }
+        }
+        let optimization_elapsed = optimization_started.elapsed();
 
-            if dist.rank == 0 && update % 10 == 0 {
-                info!(
-                    category = "TRAINER",
-                    mode = "spo",
-                    update = update,
-                    replay_len = replay.len(),
-                    mpo_total_loss = last_mpo_total,
-                    "SPO update step"
-                );
-            }
+        if is_lead {
+            let denom = (optimization_updates as f64).max(1.0);
+            let mean_actor_loss = actor_loss_sum / denom;
+            let mean_critic_loss = critic_loss_sum / denom;
+            let mean_temp_loss = temp_loss_sum / denom;
+            let mean_alpha_loss = alpha_loss_sum / denom;
+            let mean_mpo_total_loss = mpo_total_loss_sum / denom;
+
+            let mean_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns.iter().copied().sum::<f32>() / (recent_returns.len() as f32)
+            };
+            let max_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+            let min_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min)
+            };
+            let mean_ep_len = if recent_lengths.is_empty() {
+                0.0
+            } else {
+                recent_lengths.iter().map(|v| *v as f32).sum::<f32>() / (recent_lengths.len() as f32)
+            };
+            let max_ep_len = recent_lengths.iter().copied().max().unwrap_or(0);
+            let min_ep_len = recent_lengths.iter().copied().min().unwrap_or(0);
+
+            let rollout_steps = (args.rollout_length * args.num_envs * dist.world_size) as f64;
+            let total_update_secs = (rollout_elapsed + optimization_elapsed)
+                .as_secs_f64()
+                .max(1.0e-9);
+            let steps_per_second = rollout_steps / total_update_secs;
+            let timesteps = (update + 1) * args.rollout_length * args.num_envs * dist.world_size;
+
+            info!(
+                category = "TRAINER",
+                policy_version = update + 1,
+                actor_loss = mean_actor_loss,
+                critic_loss = mean_critic_loss,
+                entropy = 0.0,
+                global_grad_norm = 0.0,
+                mpo_temperature_loss = mean_temp_loss,
+                mpo_alpha_loss = mean_alpha_loss,
+                mpo_total_loss = mean_mpo_total_loss,
+                replay_len = replay.len(),
+                "train"
+            );
+
+            info!(
+                category = "ACTOR",
+                phase = "Training/Actor",
+                mean_return,
+                max_return,
+                min_return,
+                episode_length_mean = mean_ep_len,
+                episode_length_max = max_ep_len,
+                episode_length_min = min_ep_len,
+                "actor"
+            );
+
+            info!(
+                category = "MISC",
+                timesteps,
+                steps_per_second,
+                learning_rate = current_actor_lr,
+                critic_learning_rate = current_critic_lr,
+                "misc"
+            );
+
+            debug!(
+                category = "MISC",
+                timesteps,
+                rollout_duration_ms = rollout_elapsed.as_secs_f64() * 1_000.0,
+                optimization_duration_ms = optimization_elapsed.as_secs_f64() * 1_000.0,
+                replay_len = replay.len(),
+                mpo_total_loss = mean_mpo_total_loss,
+                "details"
+            );
         }
 
-        if is_lead && args.eval_interval > 0 && update > 0 && update % args.eval_interval == 0 {
+        if is_lead
+            && args.eval_interval > 0
+            && (update % args.eval_interval == 0)
+            && args.num_eval_episodes > 0
+        {
             if let Some(eval_pool) = eval_pool.as_ref() {
+                let eval_started = Instant::now();
                 let eval_stats = run_search_eval(
                     eval_pool,
                     &agent_online,
@@ -435,17 +617,21 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     &device,
                     args.seed.wrapping_add(update as u64),
                 )?;
+                let eval_duration_ms = eval_started.elapsed().as_secs_f64() * 1_000.0;
 
                 info!(
-                    category = "EVAL",
-                    mode = "spo",
-                    update = update,
+                    category = "EVALUATOR",
+                    phase = "Evaluator",
+                    policy_version = update + 1,
                     episodes = eval_stats.episodes,
-                    return_mean = eval_stats.mean_return as f64,
-                    return_max = eval_stats.max_return as f64,
-                    return_min = eval_stats.min_return as f64,
-                    ep_len_mean = eval_stats.mean_ep_len as f64,
-                    "SPO evaluation"
+                    mean_return = eval_stats.mean_return,
+                    max_return = eval_stats.max_return,
+                    min_return = eval_stats.min_return,
+                    episode_length_mean = eval_stats.mean_ep_len,
+                    episode_length_max = eval_stats.max_ep_len,
+                    episode_length_min = eval_stats.min_ep_len,
+                    duration_ms = eval_duration_ms,
+                    "deterministic_eval"
                 );
             }
         }

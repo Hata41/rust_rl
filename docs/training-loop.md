@@ -1,15 +1,16 @@
-# Training Loop
+# PPO Training Loop
 
-This page explains runtime behavior: update order, seeding, rollout/eval semantics, and where to edit specific behavior.
+This page explains PPO runtime behavior: update order, seeding, rollout/eval semantics, and where to edit specific behavior.
 For static module dependencies and data contracts, see [Architecture](architecture.md).
+For SPO runtime internals, see [spo-training-loop.md](spo-training-loop.md).
 
 ## Runtime sequence
 
-`src/bin/rust_ppo.rs` -> `train::run` -> `AsyncEnvPool` / `Rollout` / `Agent` / PPO losses.
+`src/bin/rust_rl.rs` -> `train::run` -> `AsyncEnvPool` / `Rollout` / `Agent` / PPO losses.
 
 Direct links:
 
-- Entrypoint and run dispatch: [src/bin/rust_ppo.rs](../src/bin/rust_ppo.rs#L190)
+- Entrypoint and run dispatch: [src/bin/rust_rl.rs](../src/bin/rust_rl.rs#L190)
 - Training orchestrator: [src/ppo/train.rs](../src/ppo/train.rs#L325)
 - Environment layer: [src/env.rs](../src/env.rs#L32)
 - Rollout storage: [src/ppo/buffer.rs](../src/ppo/buffer.rs#L167)
