@@ -19,13 +19,13 @@ cargo check
 PPO:
 
 ```bash
-cargo run --release -- --config base_config.yaml
+cargo run --release -- --config ppo_config.yaml
 ```
 
 SPO:
 
 ```bash
-cargo run --release --bin rust_spo -- --config spo_config.yaml
+cargo run --release --bin spo -- --config spo_config.yaml
 ```
 
 Expected telemetry categories:
@@ -46,13 +46,13 @@ cargo check
 2. PPO baseline run:
 
 ```bash
-cargo run --release -- --config base_config.yaml
+cargo run --release -- --config ppo_config.yaml
 ```
 
 3. SPO baseline run:
 
 ```bash
-cargo run --release --bin rust_spo -- --config spo_config.yaml
+cargo run --release --bin spo -- --config spo_config.yaml
 ```
 
 4. Override one variable at a time from CLI to isolate effects.

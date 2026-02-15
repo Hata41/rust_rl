@@ -6,7 +6,7 @@ use rand_distr::Gamma;
 
 use crate::config::Args;
 use crate::env::{AsyncEnvPool, StepOut};
-use crate::env_model::{build_actor_input_batch, EnvModelKind};
+use crate::env_model::{build_actor_input_batch, build_critic_input_batch, EnvModelKind};
 use crate::models::Agent;
 use crate::ppo::loss::sample_actions_categorical;
 
@@ -15,6 +15,7 @@ pub struct SearchConfig {
     pub num_particles: usize,
     pub search_depth: usize,
     pub search_gamma: f32,
+    pub search_gae_lambda: f32,
     pub resampling_period: usize,
     pub resampling_ess_threshold: f32,
     pub adaptive_temperature: bool,
@@ -139,8 +140,8 @@ pub fn run_smc_search<B: Backend>(
     env: &AsyncEnvPool,
     agent: &Agent<B>,
     root_state_ids: &[i32],
-    root_obs: &[rustpool::core::types::GenericObs],
-    root_action_masks: &[Vec<bool>],
+    root_obs: &[&rustpool::core::types::GenericObs],
+    root_action_masks: &[&[bool]],
     model_kind: EnvModelKind,
     args: &Args,
     cfg: SearchConfig,
@@ -170,8 +171,8 @@ pub fn run_smc_search<B: Backend>(
     let mut current_masks = Vec::with_capacity(batch * cfg.num_particles);
     for idx in 0..batch {
         for _ in 0..cfg.num_particles {
-            current_obs.push(root_obs[idx].clone());
-            current_masks.push(root_action_masks[idx].clone());
+            current_obs.push((*root_obs[idx]).clone());
+            current_masks.push(root_action_masks[idx].to_vec());
         }
     }
 
@@ -181,8 +182,12 @@ pub fn run_smc_search<B: Backend>(
     let mut last_steps = Vec::new();
     let mut root_actions = vec![0i32; batch];
     let mut root_particle_actions = vec![0i32; batch * cfg.num_particles];
-    let mut particle_returns = vec![0.0f32; batch * cfg.num_particles];
+    let mut particle_td_weights = vec![0.0f32; batch * cfg.num_particles];
+    let mut particle_gae = vec![0.0f32; batch * cfg.num_particles];
+    let mut particle_terminal = vec![false; batch * cfg.num_particles];
     let mut particle_weights = vec![1.0f32 / (cfg.num_particles as f32); batch * cfg.num_particles];
+
+    let mut logits_buf = vec![0.0f32; cfg.num_particles];
 
     for depth_idx in 0..cfg.search_depth {
         let n = current_obs.len();
@@ -198,6 +203,20 @@ pub fn run_smc_search<B: Backend>(
 
         let actor_input =
             build_actor_input_batch::<B>(&current_obs, model_kind, args, obs_dim, device)?;
+        let current_values_t = agent
+            .critic_values(build_critic_input_batch::<B>(
+                &current_obs,
+                model_kind,
+                args,
+                obs_dim,
+                device,
+            )?)
+            .reshape([n]);
+        let current_values = current_values_t
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("failed to convert current values: {e}"))?;
+
         let logits = agent.actor_logits(actor_input);
         let mask_t = burn::tensor::Tensor::<B, 2>::from_data(
             burn::tensor::TensorData::new(mask_flat, [n, action_dim]),
@@ -220,19 +239,40 @@ pub fn run_smc_search<B: Backend>(
         }
 
         let steps = env.simulate_batch(&current_state_ids, &actions)?;
+        let next_obs = steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
+        let next_values_t = agent
+            .critic_values(build_critic_input_batch::<B>(
+                &next_obs,
+                model_kind,
+                args,
+                obs_dim,
+                device,
+            )?)
+            .reshape([n]);
+        let next_values = next_values_t
+            .to_data()
+            .to_vec::<f32>()
+            .map_err(|e| anyhow::anyhow!("failed to convert next values: {e}"))?;
 
-        let discount = cfg.search_gamma.powi(depth_idx as i32);
         for i in 0..steps.len() {
-            particle_returns[i] += discount * steps[i].reward;
+            let td_error = steps[i].reward + next_values[i] - current_values[i];
+            let terminal_mask = if particle_terminal[i] { 0.0 } else { 1.0 };
+            particle_td_weights[i] += td_error * terminal_mask;
+
+            let discount = if steps[i].done { 0.0 } else { 1.0 };
+            let gae_decay = (cfg.search_gamma * cfg.search_gae_lambda * discount).powi(depth_idx as i32);
+            particle_gae[i] += td_error * gae_decay;
+
+            particle_terminal[i] = particle_terminal[i] || steps[i].done;
         }
 
         for env_idx in 0..batch {
             let start = env_idx * cfg.num_particles;
             let end = start + cfg.num_particles;
-            let returns = &particle_returns[start..end];
+            let td_weights = &particle_td_weights[start..end];
             let temperature = if cfg.adaptive_temperature {
-                let mean = returns.iter().sum::<f32>() / cfg.num_particles as f32;
-                let var = returns
+                let mean = td_weights.iter().sum::<f32>() / cfg.num_particles as f32;
+                let var = td_weights
                     .iter()
                     .map(|r| {
                         let d = *r - mean;
@@ -244,8 +284,10 @@ pub fn run_smc_search<B: Backend>(
             } else {
                 cfg.fixed_temperature.max(1.0e-3)
             };
-            let logits = returns.iter().map(|r| *r / temperature).collect::<Vec<_>>();
-            let w = softmax(&logits);
+            for (i, &w) in td_weights.iter().enumerate() {
+                logits_buf[i] = w / temperature;
+            }
+            let w = softmax(&logits_buf);
             particle_weights[start..end].copy_from_slice(&w);
         }
 
@@ -253,7 +295,9 @@ pub fn run_smc_search<B: Backend>(
             let mut next_state_ids = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_obs = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_masks = Vec::with_capacity(batch * cfg.num_particles);
-            let mut next_returns = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_td_weights = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_gae = Vec::with_capacity(batch * cfg.num_particles);
+            let mut next_terminal = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_weights = Vec::with_capacity(batch * cfg.num_particles);
 
             for env_idx in 0..batch {
@@ -278,7 +322,9 @@ pub fn run_smc_search<B: Backend>(
                         );
                         next_obs.push(steps[idx].obs.clone());
                         next_masks.push(steps[idx].action_mask.clone());
-                        next_returns.push(particle_returns[idx]);
+                        next_td_weights.push(0.0);
+                        next_gae.push(particle_gae[idx]);
+                        next_terminal.push(particle_terminal[idx]);
                     }
                     let uniform = 1.0 / cfg.num_particles as f32;
                     for _ in 0..cfg.num_particles {
@@ -295,7 +341,9 @@ pub fn run_smc_search<B: Backend>(
                         );
                         next_obs.push(steps[idx].obs.clone());
                         next_masks.push(steps[idx].action_mask.clone());
-                        next_returns.push(particle_returns[idx]);
+                        next_td_weights.push(particle_td_weights[idx]);
+                        next_gae.push(particle_gae[idx]);
+                        next_terminal.push(particle_terminal[idx]);
                         next_weights.push(particle_weights[idx]);
                     }
                 }
@@ -309,7 +357,9 @@ pub fn run_smc_search<B: Backend>(
             current_state_ids = next_state_ids;
             current_obs = next_obs;
             current_masks = next_masks;
-            particle_returns = next_returns;
+            particle_td_weights = next_td_weights;
+            particle_gae = next_gae;
+            particle_terminal = next_terminal;
             particle_weights = next_weights;
         } else {
             let mut released = current_state_ids.clone();

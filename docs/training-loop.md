@@ -6,11 +6,11 @@ For SPO runtime internals, see [spo-training-loop.md](spo-training-loop.md).
 
 ## Runtime sequence
 
-`src/bin/rust_rl.rs` -> `train::run` -> `AsyncEnvPool` / `Rollout` / `Agent` / PPO losses.
+`src/bin/ppo.rs` -> `train::run` -> `AsyncEnvPool` / `Rollout` / `Agent` / PPO losses.
 
 Direct links:
 
-- Entrypoint and run dispatch: [src/bin/rust_rl.rs](../src/bin/rust_rl.rs#L190)
+- Entrypoint and run dispatch: [src/bin/ppo.rs](../src/bin/ppo.rs)
 - Training orchestrator: [src/ppo/train.rs](../src/ppo/train.rs#L325)
 - Environment layer: [src/env.rs](../src/env.rs#L32)
 - Rollout storage: [src/ppo/buffer.rs](../src/ppo/buffer.rs#L167)
@@ -46,12 +46,9 @@ Direct links:
 
 `Args.seed` influences multiple RNG domains. Keep this model in mind when refactoring:
 
-- **Backend RNG:** `B::seed(&device, args.seed ^ (rank << 32))`
-  - Ensures per-rank backend RNG divergence while preserving reproducibility.
-- **Training env pool seed root:** `args.seed + rank_env_seed_offset`
-  - Offset is `rank * local_num_envs`.
-- **Initial reset seed:** `args.seed + 10_000 + rank_env_seed_offset`
-  - Provides deterministic startup episodes per rank.
+- **Backend RNG:** `B::seed(&device, args.seed)`
+- **Training env pool seed root:** `args.seed`
+- **Initial reset seed:** `args.seed + 10_000`
 - **Eval pool seed root:** `args.seed + 999`
   - Deterministic eval pool creation and eval resets.
 - **Minibatch shuffle RNG:** `StdRng::seed_from_u64(args.seed ^ 0xA11CE)`

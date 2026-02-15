@@ -1,6 +1,4 @@
 use anyhow::{bail, Result};
-use burn::backend::cuda::Cuda;
-use burn::collective::{finish_collective, PeerId, ReduceOperation};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
@@ -20,7 +18,7 @@ use crate::env_model::{
     detect_env_model_from_metadata, infer_obs_dim, EnvModelKind,
 };
 use crate::models::{Actor, Agent, Critic, PolicyInput};
-use crate::ppo::buffer::{flatten_obs, Rollout};
+use crate::ppo::buffer::{flatten_obs_into, Rollout};
 use crate::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
@@ -251,17 +249,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         bail!("num_envs must be > 0");
     }
 
-    if args.num_envs % dist.world_size != 0 {
-        bail!(
-            "num_envs ({}) must be divisible by WORLD_SIZE ({})",
-            args.num_envs,
-            dist.world_size
-        );
-    }
-    let local_num_envs = args.num_envs / dist.world_size;
-    if local_num_envs == 0 {
-        bail!("local_num_envs must be > 0");
-    }
+    let local_num_envs = args.num_envs;
 
     let local_batch = args.rollout_length * local_num_envs;
     if local_batch % args.num_minibatches != 0 {
@@ -271,21 +259,17 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         );
     }
 
-    let peer_id = PeerId::from(dist.rank);
-
-    B::seed(&device, args.seed ^ ((dist.rank as u64) << 32));
-
-    let rank_env_seed_offset = (dist.rank as u64) * (local_num_envs as u64);
+    B::seed(&device, args.seed);
 
     let model_probe = make_env(&args.task_id, &args, args.seed)?;
     let model_kind = detect_env_model_from_metadata(&*model_probe);
 
-    let env_pool = AsyncEnvPool::new(local_num_envs, args.seed + rank_env_seed_offset, {
+    let env_pool = AsyncEnvPool::new(local_num_envs, args.seed, {
         let args = args.clone();
         move |seed| make_env(&args.task_id, &args, seed).unwrap()
     })?;
 
-    let reset_out = env_pool.reset_all(Some(args.seed + 10_000 + rank_env_seed_offset))?;
+    let reset_out = env_pool.reset_all(Some(args.seed + 10_000))?;
     let mut cur_obs = reset_out.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
     let mut cur_mask = reset_out
         .iter()
@@ -301,7 +285,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         info!(
             category = "MISC",
             task = %args.task_id,
-            world_size = dist.world_size,
+            world_size = 1,
             global_num_envs = args.num_envs,
             local_num_envs,
             rollout_length = args.rollout_length,
@@ -346,7 +330,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             update,
             num_updates = args.num_updates,
             rank = dist.rank,
-            world_size = dist.world_size
+            world_size = 1
         );
         let _update_guard = update_span.enter();
 
@@ -377,6 +361,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         };
 
         let rollout_started = Instant::now();
+        let mut rollout_model_duration_ms = 0.0f64;
+        let mut rollout_env_step_duration_ms = 0.0f64;
+        let mut rollout_store_duration_ms = 0.0f64;
         {
             let rollout_span = span!(
                 Level::DEBUG,
@@ -402,12 +389,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
                 if !is_binpack {
                     for e in 0..local_num_envs {
-                        let flat = flatten_obs(&cur_obs[e]);
                         let base = e * obs_dim;
-                        obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
+                        flatten_obs_into(&cur_obs[e], &mut obs_flat_all[base..base + obs_dim]);
                     }
                 }
 
+                let rollout_model_started = Instant::now();
                 let (logits, values2) = agent.policy_value(build_policy_input_batch::<B>(
                     &cur_obs,
                     model_kind,
@@ -421,6 +408,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 let actions_t = sample_actions_categorical::<B>(logits.clone(), mask_t.clone(), &device);
 
                 let (logp_t, _ent_t) = logprob_and_entropy::<B>(logits, mask_t, actions_t.clone());
+                rollout_model_duration_ms +=
+                    rollout_model_started.elapsed().as_secs_f64() * 1_000.0;
 
                 let actions_data = actions_t.to_data();
                 let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
@@ -435,8 +424,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 let logp_vec: Vec<f32> = logp_t.to_data().to_vec().unwrap();
                 let values_vec: Vec<f32> = values.to_data().to_vec().unwrap();
 
+                let rollout_env_started = Instant::now();
                 let step_out = env_pool.step_all(&actions_vec)?;
+                rollout_env_step_duration_ms +=
+                    rollout_env_started.elapsed().as_secs_f64() * 1_000.0;
 
+                let rollout_store_started = Instant::now();
                 for e in 0..local_num_envs {
                     if is_binpack {
                         roll.store_step_binpack(
@@ -481,6 +474,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         ep_len[e] = 0;
                     }
                 }
+                rollout_store_duration_ms +=
+                    rollout_store_started.elapsed().as_secs_f64() * 1_000.0;
 
                 for e in 0..local_num_envs {
                     cur_obs[e].clone_from(&step_out[e].obs);
@@ -490,9 +485,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
             if !is_binpack {
                 for e in 0..local_num_envs {
-                    let flat = flatten_obs(&cur_obs[e]);
                     let base = e * obs_dim;
-                    obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
+                    flatten_obs_into(&cur_obs[e], &mut obs_flat_all[base..base + obs_dim]);
                 }
             }
         }
@@ -534,6 +528,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let mut critic_loss_sum = 0.0f64;
         let mut entropy_sum = 0.0f64;
         let mut grad_norm_sum = 0.0f64;
+        let mut optimization_data_prep_duration_ms = 0.0f64;
+        let mut optimization_forward_loss_duration_ms = 0.0f64;
+        let mut optimization_backward_step_duration_ms = 0.0f64;
 
         let optimization_started = Instant::now();
         {
@@ -555,6 +552,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let end = start + mb_size;
                     let mb_idx = &all_indices[start..end];
 
+                    let data_prep_started = Instant::now();
                     let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack {
                         let (
                             items_mb,
@@ -643,7 +641,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
                         (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
                     };
+                    optimization_data_prep_duration_ms +=
+                        data_prep_started.elapsed().as_secs_f64() * 1_000.0;
 
+                    let forward_loss_started = Instant::now();
                     let v = v2.reshape([mb_size]);
 
                     let (new_lp, ent) = logprob_and_entropy::<B>(logits, mask_t, act_t);
@@ -660,22 +661,16 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         args.ent_coef,
                         args.vf_coef,
                     );
+                    optimization_forward_loss_duration_ms +=
+                        forward_loss_started.elapsed().as_secs_f64() * 1_000.0;
 
+                    let backward_step_started = Instant::now();
                     let mut grads = parts.total_loss.backward();
 
                     let mut grads_actor =
                         GradientsParams::from_module::<B, Actor<B>>(&mut grads, &agent.actor);
                     let mut grads_critic =
                         GradientsParams::from_module::<B, Critic<B>>(&mut grads, &agent.critic);
-
-                    if dist.world_size > 1 {
-                        grads_actor = grads_actor
-                            .all_reduce::<Cuda<f32, i32>>(peer_id, ReduceOperation::Mean)
-                            .map_err(|e| anyhow::anyhow!("failed actor gradient all-reduce: {e:?}"))?;
-                        grads_critic = grads_critic
-                            .all_reduce::<Cuda<f32, i32>>(peer_id, ReduceOperation::Mean)
-                            .map_err(|e| anyhow::anyhow!("failed critic gradient all-reduce: {e:?}"))?;
-                    }
 
                     let global_grad_norm = clip_global_grad_norm(
                         &agent.actor,
@@ -687,6 +682,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
                     agent.actor = actor_optim.step(current_actor_lr, agent.actor, grads_actor);
                     agent.critic = critic_optim.step(current_critic_lr, agent.critic, grads_critic);
+                    optimization_backward_step_duration_ms +=
+                        backward_step_started.elapsed().as_secs_f64() * 1_000.0;
 
                     let actor_loss = parts
                         .actor_loss
@@ -793,7 +790,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 (rollout_elapsed + optimization_elapsed).as_secs_f64().max(1.0e-9);
             let steps_per_second = rollout_steps / total_update_secs;
 
-            let timesteps = (update + 1) * local_batch * dist.world_size;
+            let timesteps = (update + 1) * local_batch;
             info!(
                 category = "TRAINER",
                 policy_version = update + 1,
@@ -828,7 +825,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 category = "MISC",
                 timesteps,
                 rollout_duration_ms = rollout_elapsed.as_secs_f64() * 1_000.0,
+                rollout_model_duration_ms,
+                rollout_env_step_duration_ms,
+                rollout_store_duration_ms,
                 optimization_duration_ms = optimization_elapsed.as_secs_f64() * 1_000.0,
+                optimization_data_prep_duration_ms,
+                optimization_forward_loss_duration_ms,
+                optimization_backward_step_duration_ms,
                 advantage_pre_mean = adv_stats.pre_mean,
                 advantage_pre_std = adv_stats.pre_std,
                 advantage_post_mean = adv_stats.post_mean,
@@ -873,11 +876,6 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 );
             }
         }
-    }
-
-    if dist.world_size > 1 {
-        finish_collective::<Cuda<f32, i32>>(peer_id)
-            .map_err(|e| anyhow::anyhow!("failed to finish burn collective: {e:?}"))?;
     }
 
     Ok(())

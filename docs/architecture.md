@@ -2,8 +2,8 @@
 
 This document defines crate boundaries, dependency direction, and cross-module contracts for both algorithms:
 
-- PPO (`rust_rl` binary)
-- SPO (`rust_spo` binary)
+- PPO (`ppo` binary)
+- SPO (`spo` binary)
 
 For runtime step-by-step execution details, see:
 
@@ -36,8 +36,8 @@ Boundary rule:
 
 Core modules in `rust_rl`:
 
-- `src/bin/rust_rl.rs`: PPO process bootstrap + backend setup
-- `src/bin/rust_spo.rs`: SPO process bootstrap + backend setup
+- `src/bin/ppo.rs`: PPO process bootstrap + backend setup
+- `src/bin/spo.rs`: SPO process bootstrap + backend setup
 - `src/config.rs`: shared args schema and YAML/CLI merge logic
 - `src/env.rs`: async env pool, worker routing, snapshot lifecycle integration
 - `src/env_model.rs`: shared observation-to-model adapter for PPO and SPO
@@ -50,9 +50,9 @@ Core modules in `rust_rl`:
 
 ```mermaid
 flowchart TD
-    BINP[src/bin/rust_rl.rs] --> CFG[src/config.rs]
+    BINP[src/bin/ppo.rs] --> CFG[src/config.rs]
     BINP --> TPPO[src/ppo/train.rs]
-    BINS[src/bin/rust_spo.rs] --> CFG
+    BINS[src/bin/spo.rs] --> CFG
     BINS --> TSPO[src/spo/train.rs]
 
     TPPO --> ENV[src/env.rs]

@@ -9,7 +9,7 @@ For common failure signatures, see [troubleshooting.md](troubleshooting.md).
 
 ## Runtime sequence
 
-`src/bin/rust_spo.rs` -> `spo::train::run` -> `AsyncEnvPool` + SMC search + replay + MPO updates.
+`src/bin/spo.rs` -> `spo::train::run` -> `AsyncEnvPool` + SMC search + replay + MPO updates.
 
 Inside one SPO update:
 

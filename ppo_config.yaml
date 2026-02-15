@@ -18,17 +18,17 @@ environment:
   # BinPack-specific max number of EMS entries
   max_ems: 40
   # Max steps before an episode is truncated (if used by env)
-  max_episode_steps: 200
+  max_episode_steps: 20
 
 training_core:
   # Trajectory horizon T per environment per PPO update
-  rollout_length: 20
+  rollout_length: 5
   # Total PPO updates
   num_updates: 2000
   # PPO epochs over each collected rollout buffer
   epochs: 1
   # Number of minibatches per epoch
-  num_minibatches: 2
+  num_minibatches: 1
   # Reward discount factor
   gamma: 0.99
   # GAE lambda
@@ -62,21 +62,14 @@ architecture:
 
 evaluation:
   # Run deterministic evaluation every N updates
-  eval_interval: 2
+  eval_interval: 1
   # Number of parallel environments used during evaluation
   num_eval_envs: 50
   # Number of completed episodes to aggregate per eval phase
-  num_eval_episodes: 200
+  num_eval_episodes: 50
 
 hardware:
   # "cuda" or "cpu"
   device_type: "cpu"
   # CUDA device index used in single-process mode
   cuda_device: 0
-
-distributed:
-  # Fallback distributed values if env vars are missing.
-  # Env vars (RANK, WORLD_SIZE, LOCAL_RANK) still take priority.
-  rank: 0
-  world_size: 1
-  local_rank: 0

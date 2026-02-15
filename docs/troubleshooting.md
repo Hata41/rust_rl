@@ -115,12 +115,6 @@ If mismatch appears:
 - verify both binaries initialize shared formatter,
 - verify log fields in trainer emitters were not renamed inconsistently.
 
-## Distributed startup issues
-
-- `WORLD_SIZE must be > 0`
-- `RANK must be < WORLD_SIZE`
-- CPU mode with distributed world size > 1 is not supported.
-
 ## Build/link issues
 
 If build fails around Python linking, validate `python3-config` availability and Python dev headers/libraries expected by `build.rs`.

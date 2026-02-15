@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{parser::ValueSource, ArgMatches, CommandFactory, Parser, ValueEnum};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -117,18 +117,6 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = DeviceType::Cuda)]
     pub device_type: DeviceType,
 
-    /// Global rank (used if RANK env var is not set)
-    #[arg(long, default_value_t = 0)]
-    pub rank: usize,
-
-    /// World size (used if WORLD_SIZE env var is not set)
-    #[arg(long, default_value_t = 1)]
-    pub world_size: usize,
-
-    /// Local rank / local GPU index (used if LOCAL_RANK env var is not set)
-    #[arg(long, default_value_t = 0)]
-    pub local_rank: usize,
-
     #[arg(long, default_value_t = 20)]
     pub max_items: usize,
 
@@ -154,6 +142,10 @@ pub struct Args {
     /// SPO: sampled sequence length from replay.
     #[arg(long, default_value_t = 32)]
     pub sample_sequence_length: usize,
+
+    /// SPO: period between sampled sequence start indices in replay.
+    #[arg(long, default_value_t = 1)]
+    pub sample_period: usize,
 
     /// SPO: dual optimizer learning rate.
     #[arg(long, default_value_t = 1e-3)]
@@ -237,9 +229,6 @@ impl Default for Args {
             seed: 0,
             cuda_device: 0,
             device_type: DeviceType::Cuda,
-            rank: 0,
-            world_size: 1,
-            local_rank: 0,
             max_items: 20,
             max_ems: 40,
             max_episode_steps: 200,
@@ -247,6 +236,7 @@ impl Default for Args {
             search_depth: 4,
             replay_buffer_size: 65_536,
             sample_sequence_length: 32,
+            sample_period: 1,
             dual_lr: 1e-3,
             epsilon: 0.5,
             epsilon_policy: 1e-3,
@@ -274,7 +264,6 @@ struct FileConfig {
     architecture: ArchitectureConfig,
     evaluation: EvaluationConfig,
     hardware: HardwareConfig,
-    distributed: DistributedConfig,
     spo: SpoConfig,
 }
 
@@ -321,6 +310,7 @@ struct SpoConfig {
     search_depth: Option<usize>,
     replay_buffer_size: Option<usize>,
     sample_sequence_length: Option<usize>,
+    sample_period: Option<usize>,
     dual_lr: Option<f64>,
     epsilon: Option<f32>,
     epsilon_policy: Option<f32>,
@@ -356,14 +346,6 @@ struct EvaluationConfig {
 struct HardwareConfig {
     device_type: Option<DeviceType>,
     cuda_device: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-struct DistributedConfig {
-    rank: Option<usize>,
-    world_size: Option<usize>,
-    local_rank: Option<usize>,
 }
 
 impl Args {
@@ -449,14 +431,11 @@ impl Args {
         set_if_some!(device_type, file.hardware.device_type);
         set_if_some!(cuda_device, file.hardware.cuda_device);
 
-        set_if_some!(rank, file.distributed.rank);
-        set_if_some!(world_size, file.distributed.world_size);
-        set_if_some!(local_rank, file.distributed.local_rank);
-
         set_if_some!(num_particles, file.spo.num_particles);
         set_if_some!(search_depth, file.spo.search_depth);
         set_if_some!(replay_buffer_size, file.spo.replay_buffer_size);
         set_if_some!(sample_sequence_length, file.spo.sample_sequence_length);
+        set_if_some!(sample_period, file.spo.sample_period);
         set_if_some!(dual_lr, file.spo.dual_lr);
         set_if_some!(epsilon, file.spo.epsilon);
         set_if_some!(epsilon_policy, file.spo.epsilon_policy);
@@ -515,14 +494,11 @@ impl Args {
         set_if_cli!(device_type, "device_type");
         set_if_cli!(cuda_device, "cuda_device");
 
-        set_if_cli!(rank, "rank");
-        set_if_cli!(world_size, "world_size");
-        set_if_cli!(local_rank, "local_rank");
-
         set_if_cli!(num_particles, "num_particles");
         set_if_cli!(search_depth, "search_depth");
         set_if_cli!(replay_buffer_size, "replay_buffer_size");
         set_if_cli!(sample_sequence_length, "sample_sequence_length");
+        set_if_cli!(sample_period, "sample_period");
         set_if_cli!(dual_lr, "dual_lr");
         set_if_cli!(epsilon, "epsilon");
         set_if_cli!(epsilon_policy, "epsilon_policy");
@@ -551,36 +527,11 @@ pub struct DistInfo {
 }
 
 impl DistInfo {
-    pub fn from_env_or_args(args: &Args) -> Result<Self> {
-        let rank = std::env::var("RANK")
-            .ok()
-            .map(|v| v.parse::<usize>().context("invalid RANK"))
-            .transpose()?
-            .unwrap_or(args.rank);
-
-        let world_size = std::env::var("WORLD_SIZE")
-            .ok()
-            .map(|v| v.parse::<usize>().context("invalid WORLD_SIZE"))
-            .transpose()?
-            .unwrap_or(args.world_size);
-
-        let local_rank = std::env::var("LOCAL_RANK")
-            .ok()
-            .map(|v| v.parse::<usize>().context("invalid LOCAL_RANK"))
-            .transpose()?
-            .unwrap_or(args.local_rank);
-
-        if world_size == 0 {
-            bail!("WORLD_SIZE must be > 0");
-        }
-        if rank >= world_size {
-            bail!("RANK ({rank}) must be < WORLD_SIZE ({world_size})");
-        }
-
+    pub fn from_env_or_args(_args: &Args) -> Result<Self> {
         Ok(Self {
-            rank,
-            world_size,
-            local_rank,
+            rank: 0,
+            world_size: 1,
+            local_rank: 0,
         })
     }
 }

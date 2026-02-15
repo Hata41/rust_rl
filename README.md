@@ -34,20 +34,20 @@ cargo check
 ### 3) Run with template config
 
 ```bash
-cargo run --release -- --config base_config.yaml
+cargo run --release -- --config ppo_config.yaml
 ```
 
 ### 3b) Run SPO with template config
 
 ```bash
-cargo run --release --bin rust_spo -- --config spo_config.yaml
+cargo run --release --bin spo -- --config spo_config.yaml
 ```
 
 ### 4) Override config values from CLI
 
 ```bash
 cargo run --release -- \
-  --config base_config.yaml \
+  --config ppo_config.yaml \
   --task-id BinPack-v0 \
   --num-envs 64 \
   --rollout-length 128
@@ -59,7 +59,7 @@ cargo run --release -- \
 
 ```bash
 cargo run --release -- \
-  --config base_config.yaml \
+  --config ppo_config.yaml \
   --task-id BinPack-v0 \
   --device-type cpu
 ```
@@ -68,7 +68,7 @@ cargo run --release -- \
 
 ```bash
 cargo run --release -- \
-  --config base_config.yaml \
+  --config ppo_config.yaml \
   --task-id Maze-v0 \
   --device-type cpu
 ```
@@ -76,19 +76,12 @@ cargo run --release -- \
 ### SPO BinPack on CPU (config-only)
 
 ```bash
-cargo run --release --bin rust_spo -- --config spo_config.yaml
-```
-
-### Distributed CUDA (2 processes example)
-
-```bash
-WORLD_SIZE=2 RANK=0 LOCAL_RANK=0 cargo run --release -- --config base_config.yaml --device-type cuda
-WORLD_SIZE=2 RANK=1 LOCAL_RANK=1 cargo run --release -- --config base_config.yaml --device-type cuda
+cargo run --release --bin spo -- --config spo_config.yaml
 ```
 
 Code pointers for execution path:
 
-- Entry and backend selection (`main`): [src/bin/rust_rl.rs](src/bin/rust_rl.rs#L190)
+- Entry and backend selection (`main`): [src/bin/ppo.rs](src/bin/ppo.rs)
 - Config loading and precedence (`Args::load`): [src/config.rs](src/config.rs#L257)
 - Training orchestrator (`train::run`): [src/ppo/train.rs](src/ppo/train.rs#L325)
 - Environment pool + env factory (`AsyncEnvPool::new`, `make_env`): [src/env.rs](src/env.rs#L32), [src/env.rs](src/env.rs#L167)
@@ -120,14 +113,13 @@ Cross-cutting contracts to know before changing internals:
 ## Runtime model
 
 - Config precedence: **code defaults < YAML file < explicit CLI flags**.
-- `RANK`, `WORLD_SIZE`, `LOCAL_RANK` env vars override distributed CLI fallbacks.
-- CPU backend is single-process only (`WORLD_SIZE` must be 1).
+- Runtime is single-process (`world_size = 1`).
 
 Code pointers:
 
 - Arg merge and overrides (`apply_config_file`, `apply_cli_overrides`): [src/config.rs](src/config.rs#L294), [src/config.rs](src/config.rs#L341)
-- Distributed env resolution (`from_env_or_args`): [src/config.rs](src/config.rs#L414)
-- CPU/CUDA guardrails: [src/bin/rust_rl.rs](src/bin/rust_rl.rs#L211)
+- Dist info resolution (`from_env_or_args`): [src/config.rs](src/config.rs#L414)
+- CPU/CUDA dispatch: [src/bin/ppo.rs](src/bin/ppo.rs)
 
 For details, see [Configuration](docs/configuration.md), [PPO Training Loop](docs/training-loop.md), and [SPO Training Loop](docs/spo-training-loop.md).
 

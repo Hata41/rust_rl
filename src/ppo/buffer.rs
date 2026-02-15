@@ -22,6 +22,32 @@ pub fn flatten_obs(obs: &GenericObs) -> Vec<f32> {
     out
 }
 
+pub fn flatten_obs_into(obs: &GenericObs, out: &mut [f32]) {
+    let mut cursor = 0usize;
+    for a in obs {
+        match a {
+            ArrayData::Float32(v) => {
+                let end = cursor + v.len();
+                out[cursor..end].copy_from_slice(v);
+                cursor = end;
+            }
+            ArrayData::Int32(v) => {
+                for &x in v {
+                    out[cursor] = x as f32;
+                    cursor += 1;
+                }
+            }
+            ArrayData::Bool(v) => {
+                for &b in v {
+                    out[cursor] = if b { 1.0 } else { 0.0 };
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    debug_assert_eq!(cursor, out.len());
+}
+
 #[derive(Clone, Debug)]
 pub struct BinPackObsView<'a> {
     pub items: &'a [f32],

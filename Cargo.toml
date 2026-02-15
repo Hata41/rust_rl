@@ -5,12 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "rust_rl"
-path = "src/bin/rust_rl.rs"
+name = "ppo"
+path = "src/bin/ppo.rs"
 
 [[bin]]
-name = "rust_spo"
-path = "src/bin/rust_spo.rs"
+name = "spo"
+path = "src/bin/spo.rs"
 
 [dependencies]
 # --- PPO / infra ---

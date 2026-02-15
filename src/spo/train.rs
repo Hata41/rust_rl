@@ -89,10 +89,10 @@ fn run_search_eval<B: AutodiffBackend>(
     let mut completed_lengths = Vec::<usize>::with_capacity(args.num_eval_episodes);
 
     while completed_returns.len() < args.num_eval_episodes {
-        let cur_obs = cur_steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
+        let cur_obs = cur_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
         let cur_masks = cur_steps
             .iter()
-            .map(|s| s.action_mask.clone())
+            .map(|s| s.action_mask.as_slice())
             .collect::<Vec<_>>();
 
         let root_state_ids = env_pool.snapshot(&eval_env_ids)?;
@@ -108,6 +108,7 @@ fn run_search_eval<B: AutodiffBackend>(
                 num_particles: args.num_particles,
                 search_depth: args.search_depth,
                 search_gamma: args.search_gamma,
+                search_gae_lambda: args.search_gae_lambda,
                 resampling_period: args.resampling_period,
                 resampling_ess_threshold: args.resampling_ess_threshold,
                 adaptive_temperature: args.adaptive_temperature,
@@ -250,7 +251,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     let obs_dim = infer_obs_dim(&first_obs.obs, model_kind, &args);
     let action_dim = first_obs.action_mask.len();
 
-    let mut replay = ReplayBuffer::new(args.replay_buffer_size, action_dim);
+    let mut replay = ReplayBuffer::new(args.replay_buffer_size, args.num_envs, action_dim);
 
     let mut agent_online = Agent::<B>::new(obs_dim, args.hidden_dim, action_dim, &device);
     let mut agent_target = agent_online.clone();
@@ -262,7 +263,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     let mut actor_optim = AdamConfig::new().init::<B, crate::models::Actor<B>>();
     let mut critic_optim = AdamConfig::new().init::<B, crate::models::Critic<B>>();
     let mut dual_optim = AdamConfig::new().init::<B, MpoDuals<B>>();
-    let mut rng = StdRng::seed_from_u64(args.seed + dist.rank as u64);
+    let mut rng = StdRng::seed_from_u64(args.seed);
     let mut ep_return = vec![0.0f32; args.num_envs];
     let mut ep_len = vec![0usize; args.num_envs];
     let recent_window = 100usize;
@@ -273,8 +274,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         info!(
             category = "MISC",
             task = %args.task_id,
-            world_size = dist.world_size,
-            global_num_envs = args.num_envs * dist.world_size,
+            world_size = 1,
+            global_num_envs = args.num_envs,
             local_num_envs = args.num_envs,
             rollout_length = args.rollout_length,
             local_batch = args.rollout_length * args.num_envs,
@@ -283,6 +284,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             num_particles = args.num_particles,
             search_depth = args.search_depth,
             replay_capacity = args.replay_buffer_size,
+            replay_period = args.sample_period,
             "startup"
         );
     }
@@ -299,14 +301,18 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let current_critic_lr = args.critic_lr * alpha;
 
         let rollout_started = Instant::now();
+        let mut search_duration_ms = 0.0f64;
+        let mut env_step_duration_ms = 0.0f64;
+        let mut replay_add_duration_ms = 0.0f64;
         for _ in 0..args.rollout_length {
-            let cur_obs = cur_steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
+            let cur_obs = cur_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
             let cur_masks = cur_steps
                 .iter()
-                .map(|s| s.action_mask.clone())
+                .map(|s| s.action_mask.as_slice())
                 .collect::<Vec<_>>();
 
             let root_state_ids = env_pool.snapshot(&env_ids)?;
+            let search_started = Instant::now();
             let search_out = run_smc_search(
                 &env_pool,
                 &agent_online,
@@ -319,6 +325,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     num_particles: args.num_particles,
                     search_depth: args.search_depth,
                     search_gamma: args.search_gamma,
+                    search_gae_lambda: args.search_gae_lambda,
                     resampling_period: args.resampling_period,
                     resampling_ess_threshold: args.resampling_ess_threshold,
                     adaptive_temperature: args.adaptive_temperature,
@@ -331,12 +338,15 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 &device,
                 &mut rng,
             )?;
+            search_duration_ms += search_started.elapsed().as_secs_f64() * 1_000.0;
 
             env_pool.release_batch(&root_state_ids);
             let actions = search_out.root_actions.clone();
             env_pool.release_batch(&search_out.leaf_state_ids);
 
+            let env_step_started = Instant::now();
             let next_steps = env_pool.step_all(&actions)?;
+            env_step_duration_ms += env_step_started.elapsed().as_secs_f64() * 1_000.0;
             for env_idx in 0..args.num_envs {
                 ep_return[env_idx] += next_steps[env_idx].reward;
                 ep_len[env_idx] += 1;
@@ -354,24 +364,31 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 }
             }
 
-            for (env_idx, ((cur, nxt), action)) in cur_steps
+            let obs_batch = cur_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
+            let next_obs_batch = next_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
+            let rewards = next_steps.iter().map(|s| s.reward).collect::<Vec<_>>();
+            let dones = next_steps.iter().map(|s| s.done).collect::<Vec<_>>();
+            let action_masks = cur_steps
                 .iter()
-                .zip(next_steps.iter())
-                .zip(actions.iter())
-                .enumerate()
-            {
-                let row0 = env_idx * action_dim;
-                replay.add(
-                    &cur.obs,
-                    &nxt.obs,
-                    *action,
-                    nxt.reward,
-                    nxt.done,
-                    &cur.action_mask,
-                    &nxt.action_mask,
-                    &search_out.root_action_weights[row0..row0 + action_dim],
-                )?;
-            }
+                .map(|s| s.action_mask.as_slice())
+                .collect::<Vec<_>>();
+            let next_action_masks = next_steps
+                .iter()
+                .map(|s| s.action_mask.as_slice())
+                .collect::<Vec<_>>();
+
+            let replay_add_started = Instant::now();
+            replay.add_timestep(
+                &obs_batch,
+                &next_obs_batch,
+                &actions,
+                &rewards,
+                &dones,
+                &action_masks,
+                &next_action_masks,
+                &search_out.root_action_weights,
+            )?;
+            replay_add_duration_ms += replay_add_started.elapsed().as_secs_f64() * 1_000.0;
 
             cur_steps = next_steps;
         }
@@ -384,13 +401,27 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let mut alpha_loss_sum = 0.0f64;
         let mut mpo_total_loss_sum = 0.0f64;
         let mut optimization_updates = 0usize;
+        let mut sample_duration_ms = 0.0f64;
+        let mut model_forward_loss_duration_ms = 0.0f64;
+        let mut backward_step_duration_ms = 0.0f64;
 
-        if replay.len() >= args.sample_sequence_length * args.num_envs {
+        if replay.can_sample(args.sample_sequence_length) {
             for _ in 0..args.epochs {
                 for _ in 0..args.num_minibatches {
-                    let sampled = replay.sample_random(args.num_envs, &mut rng);
+                    let sample_started = Instant::now();
+                    let sampled = replay.sample_sequences(
+                        args.num_envs,
+                        args.sample_sequence_length,
+                        args.sample_period,
+                        &mut rng,
+                    );
+                    sample_duration_ms += sample_started.elapsed().as_secs_f64() * 1_000.0;
                     let batch = sampled.actions.len();
+                    if batch == 0 {
+                        continue;
+                    }
 
+                    let forward_started = Instant::now();
                     let policy_logits = agent_online.actor_logits(build_actor_input_batch::<B>(
                         &sampled.obs,
                         model_kind,
@@ -442,7 +473,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         args.epsilon,
                         args.epsilon_policy,
                     );
+                    model_forward_loss_duration_ms +=
+                        forward_started.elapsed().as_secs_f64() * 1_000.0;
 
+                    let backward_started = Instant::now();
                     let mut grads = parts.total_loss.backward();
 
                     let grads_actor = GradientsParams::from_module::<B, crate::models::Actor<B>>(
@@ -462,6 +496,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     duals = dual_optim.step(args.dual_lr, duals, grads_duals);
 
                     soft_update_params::<Agent<B>, B>(&mut agent_target, &agent_online, args.tau);
+                    backward_step_duration_ms +=
+                        backward_started.elapsed().as_secs_f64() * 1_000.0;
 
                     let actor_loss = parts
                         .actor_loss
@@ -547,12 +583,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let max_ep_len = recent_lengths.iter().copied().max().unwrap_or(0);
             let min_ep_len = recent_lengths.iter().copied().min().unwrap_or(0);
 
-            let rollout_steps = (args.rollout_length * args.num_envs * dist.world_size) as f64;
+            let rollout_steps = (args.rollout_length * args.num_envs) as f64;
             let total_update_secs = (rollout_elapsed + optimization_elapsed)
                 .as_secs_f64()
                 .max(1.0e-9);
             let steps_per_second = rollout_steps / total_update_secs;
-            let timesteps = (update + 1) * args.rollout_length * args.num_envs * dist.world_size;
+            let timesteps = (update + 1) * args.rollout_length * args.num_envs;
 
             info!(
                 category = "TRAINER",
@@ -593,7 +629,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 category = "MISC",
                 timesteps,
                 rollout_duration_ms = rollout_elapsed.as_secs_f64() * 1_000.0,
+                rollout_search_duration_ms = search_duration_ms,
+                rollout_env_step_duration_ms = env_step_duration_ms,
+                rollout_replay_add_duration_ms = replay_add_duration_ms,
                 optimization_duration_ms = optimization_elapsed.as_secs_f64() * 1_000.0,
+                optimization_sample_duration_ms = sample_duration_ms,
+                optimization_forward_loss_duration_ms = model_forward_loss_duration_ms,
+                optimization_backward_step_duration_ms = backward_step_duration_ms,
                 replay_len = replay.len(),
                 mpo_total_loss = mean_mpo_total_loss,
                 "details"

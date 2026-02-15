@@ -3,8 +3,8 @@
 This project uses one shared dashboard formatting stack for PPO and SPO:
 
 - formatter and category rendering: [src/telemetry.rs](../src/telemetry.rs)
-- PPO wiring: [src/bin/rust_rl.rs](../src/bin/rust_rl.rs)
-- SPO wiring: [src/bin/rust_spo.rs](../src/bin/rust_spo.rs)
+- PPO wiring: [src/bin/ppo.rs](../src/bin/ppo.rs)
+- SPO wiring: [src/bin/spo.rs](../src/bin/spo.rs)
 
 ## Categories
 

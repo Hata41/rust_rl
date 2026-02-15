@@ -3,10 +3,11 @@ use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Tensor, TensorData};
 use rustpool::core::rl_env::RlEnv;
 use rustpool::core::types::GenericObs;
+use std::borrow::Borrow;
 
 use crate::config::Args;
 use crate::models::{ActorInput, CriticInput, PolicyInput};
-use crate::ppo::buffer::{flatten_obs, parse_binpack_obs};
+use crate::ppo::buffer::{flatten_obs, flatten_obs_into, parse_binpack_obs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvModelKind {
@@ -47,7 +48,7 @@ type BinPackBatch<B> = (
 );
 
 fn build_binpack_batch_tensors<B: Backend>(
-    obs_batch: &[GenericObs],
+    obs_batch: &[impl Borrow<GenericObs>],
     args: &Args,
     device: &B::Device,
 ) -> Result<BinPackBatch<B>> {
@@ -60,7 +61,7 @@ fn build_binpack_batch_tensors<B: Backend>(
     let mut ems_valid_f32 = vec![0.0f32; batch * args.max_ems];
 
     for (row, obs) in obs_batch.iter().enumerate() {
-        let parsed = parse_binpack_obs(obs, args.max_items, args.max_ems)?;
+        let parsed = parse_binpack_obs(obs.borrow(), args.max_items, args.max_ems)?;
 
         let items_base = row * args.max_items * 3;
         let ems_base = row * args.max_ems * 6;
@@ -114,7 +115,7 @@ fn build_binpack_batch_tensors<B: Backend>(
 }
 
 pub fn build_actor_input_batch<B: Backend>(
-    obs_batch: &[GenericObs],
+    obs_batch: &[impl Borrow<GenericObs>],
     model_kind: EnvModelKind,
     args: &Args,
     obs_dim: usize,
@@ -125,9 +126,8 @@ pub fn build_actor_input_batch<B: Backend>(
             let batch = obs_batch.len();
             let mut obs_flat = vec![0.0f32; batch * obs_dim];
             for (e, obs) in obs_batch.iter().enumerate() {
-                let flat = flatten_obs(obs);
                 let base = e * obs_dim;
-                obs_flat[base..base + obs_dim].copy_from_slice(&flat);
+                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
             let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             ActorInput::Dense { obs: obs_t }
@@ -146,7 +146,7 @@ pub fn build_actor_input_batch<B: Backend>(
 }
 
 pub fn build_critic_input_batch<B: Backend>(
-    obs_batch: &[GenericObs],
+    obs_batch: &[impl Borrow<GenericObs>],
     model_kind: EnvModelKind,
     args: &Args,
     obs_dim: usize,
@@ -157,9 +157,8 @@ pub fn build_critic_input_batch<B: Backend>(
             let batch = obs_batch.len();
             let mut obs_flat = vec![0.0f32; batch * obs_dim];
             for (e, obs) in obs_batch.iter().enumerate() {
-                let flat = flatten_obs(obs);
                 let base = e * obs_dim;
-                obs_flat[base..base + obs_dim].copy_from_slice(&flat);
+                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
             let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             CriticInput::Dense { obs: obs_t }
@@ -180,7 +179,7 @@ pub fn build_critic_input_batch<B: Backend>(
 }
 
 pub fn build_policy_input_batch<B: Backend>(
-    obs_batch: &[GenericObs],
+    obs_batch: &[impl Borrow<GenericObs>],
     model_kind: EnvModelKind,
     args: &Args,
     obs_dim: usize,
@@ -191,9 +190,8 @@ pub fn build_policy_input_batch<B: Backend>(
             let batch = obs_batch.len();
             let mut obs_flat = vec![0.0f32; batch * obs_dim];
             for (e, obs) in obs_batch.iter().enumerate() {
-                let flat = flatten_obs(obs);
                 let base = e * obs_dim;
-                obs_flat[base..base + obs_dim].copy_from_slice(&flat);
+                flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
             let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             PolicyInput::Dense { obs: obs_t }
