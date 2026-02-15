@@ -4,85 +4,26 @@ use burn::collective::{finish_collective, PeerId, ReduceOperation};
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{Bool, ElementConversion, Tensor, TensorData};
+use burn::tensor::{ElementConversion, Tensor, TensorData};
 use burn::tensor::Int;
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
-use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::time::Instant;
 use tracing::{debug, info, span, Level};
-use rustpool::core::types::GenericObs;
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
-use crate::models::{Actor, ActorInput, Agent, Critic, CriticInput, PolicyInput};
-use crate::ppo::buffer::{flatten_obs, parse_binpack_obs, Rollout};
+use crate::env_model::{
+    build_actor_input_batch, build_critic_input_batch, build_policy_input_batch,
+    build_policy_input_from_binpack_parts,
+    detect_env_model_from_metadata, infer_obs_dim, EnvModelKind,
+};
+use crate::models::{Actor, Agent, Critic, PolicyInput};
+use crate::ppo::buffer::{flatten_obs, Rollout};
 use crate::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
-
-fn build_binpack_batch_tensors<B: AutodiffBackend>(
-    obs_batch: &[GenericObs],
-    max_items: usize,
-    max_ems: usize,
-    device: &B::Device,
-) -> Result<(
-    Tensor<B, 3>,
-    Tensor<B, 3>,
-    Tensor<B, 2, Bool>,
-    Tensor<B, 2, Bool>,
-    Tensor<B, 2>,
-    Tensor<B, 2>,
-)> {
-    let batch = obs_batch.len();
-    let mut items = vec![0.0f32; batch * max_items * 3];
-    let mut ems = vec![0.0f32; batch * max_ems * 6];
-    let mut items_pad = vec![false; batch * max_items];
-    let mut ems_pad = vec![false; batch * max_ems];
-    let mut items_valid_f32 = vec![0.0f32; batch * max_items];
-    let mut ems_valid_f32 = vec![0.0f32; batch * max_ems];
-
-    obs_batch
-        .par_iter()
-        .zip(items.par_chunks_mut(max_items * 3))
-        .zip(ems.par_chunks_mut(max_ems * 6))
-        .zip(items_pad.par_chunks_mut(max_items))
-        .zip(ems_pad.par_chunks_mut(max_ems))
-        .zip(items_valid_f32.par_chunks_mut(max_items))
-        .zip(ems_valid_f32.par_chunks_mut(max_ems))
-        .try_for_each(
-            |((((((obs, items_row), ems_row), items_pad_row), ems_pad_row), items_valid_row), ems_valid_row)| -> Result<()> {
-                let parsed = parse_binpack_obs(obs, max_items, max_ems)?;
-
-                items_row.copy_from_slice(&parsed.items);
-                ems_row.copy_from_slice(&parsed.ems);
-
-                for i in 0..max_items {
-                    let valid = parsed.items_valid[i];
-                    items_pad_row[i] = !valid;
-                    items_valid_row[i] = if valid { 1.0 } else { 0.0 };
-                }
-
-                for i in 0..max_ems {
-                    let valid = parsed.ems_valid[i];
-                    ems_pad_row[i] = !valid;
-                    ems_valid_row[i] = if valid { 1.0 } else { 0.0 };
-                }
-
-                Ok(())
-            },
-        )?;
-
-    let items_t = Tensor::<B, 3>::from_data(TensorData::new(items, [batch, max_items, 3]), device);
-    let ems_t = Tensor::<B, 3>::from_data(TensorData::new(ems, [batch, max_ems, 6]), device);
-    let items_pad_t = Tensor::<B, 2, Bool>::from_data(TensorData::new(items_pad, [batch, max_items]), device);
-    let ems_pad_t = Tensor::<B, 2, Bool>::from_data(TensorData::new(ems_pad, [batch, max_ems]), device);
-    let items_valid_t = Tensor::<B, 2>::from_data(TensorData::new(items_valid_f32, [batch, max_items]), device);
-    let ems_valid_t = Tensor::<B, 2>::from_data(TensorData::new(ems_valid_f32, [batch, max_ems]), device);
-
-    Ok((items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t))
-}
 
 fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
     if num_updates == 0 {
@@ -184,11 +125,10 @@ fn run_deterministic_eval<B: AutodiffBackend>(
     eval_seed: u64,
     num_eval_envs: usize,
     num_eval_episodes: usize,
-    is_binpack: bool,
+    model_kind: EnvModelKind,
+    args: &Args,
     obs_dim: usize,
     action_dim: usize,
-    max_items: usize,
-    max_ems: usize,
     device: &B::Device,
 ) -> Result<EvalStats> {
     if num_eval_envs == 0 || num_eval_episodes == 0 {
@@ -228,37 +168,19 @@ fn run_deterministic_eval<B: AutodiffBackend>(
             device,
         );
 
-        let logits = if is_binpack {
-            let (items_t, ems_t, items_pad_t, ems_pad_t, _items_valid_t, _ems_valid_t) =
-                build_binpack_batch_tensors::<B>(&cur_obs, max_items, max_ems, device)?;
-
-            agent
-                .actor_logits(ActorInput::BinPack {
-                    ems: ems_t,
-                    items: items_t,
-                    ems_pad_mask: ems_pad_t,
-                    items_pad_mask: items_pad_t,
-                })
-                .detach()
-        } else {
-            let mut obs_flat_all = vec![0.0f32; num_eval_envs * obs_dim];
-            for e in 0..num_eval_envs {
-                let flat = flatten_obs(&cur_obs[e]);
-                let base = e * obs_dim;
-                obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
-            }
-            let obs_t = Tensor::<B, 2>::from_data(
-                TensorData::new(obs_flat_all, [num_eval_envs, obs_dim]),
+        let logits = agent
+            .actor_logits(build_actor_input_batch::<B>(
+                &cur_obs,
+                model_kind,
+                args,
+                obs_dim,
                 device,
-            );
-            agent
-                .actor_logits(ActorInput::Dense { obs: obs_t })
-                .detach()
-        };
+            )?)
+            .detach();
 
         let masked = masked_logits(logits, mask_t);
         let probs = burn::tensor::activation::softmax(masked, 1);
-        let actions_t = probs.argmax(1).squeeze::<1>();
+        let actions_t = probs.argmax(1).reshape([num_eval_envs]);
 
         let actions_data = actions_t.to_data();
         let actions_vec: Vec<i32> = match actions_data.clone().to_vec::<i32>() {
@@ -355,6 +277,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
     let rank_env_seed_offset = (dist.rank as u64) * (local_num_envs as u64);
 
+    let model_probe = make_env(&args.task_id, &args, args.seed)?;
+    let model_kind = detect_env_model_from_metadata(&*model_probe);
+
     let env_pool = AsyncEnvPool::new(local_num_envs, args.seed + rank_env_seed_offset, {
         let args = args.clone();
         move |seed| make_env(&args.task_id, &args, seed).unwrap()
@@ -367,13 +292,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         .map(|s| s.action_mask.clone())
         .collect::<Vec<_>>();
 
-    let is_binpack = args.task_id == "BinPack-v0";
+    let is_binpack = model_kind == EnvModelKind::BinPackStructured;
 
-    let obs_dim = if is_binpack {
-        args.max_items * 3 + args.max_ems * 6
-    } else {
-        flatten_obs(&cur_obs[0]).len()
-    };
+    let obs_dim = infer_obs_dim(&cur_obs[0], model_kind, &args);
     let action_dim = cur_mask[0].len();
 
     if is_lead {
@@ -479,34 +400,22 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     &device,
                 );
 
-                let (logits, values2) = if is_binpack {
-                    let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
-                        build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
-
-                    let (logits, values2) = agent.policy_value(PolicyInput::BinPack {
-                        ems: ems_t,
-                        items: items_t,
-                        ems_pad_mask: ems_pad_t,
-                        items_pad_mask: items_pad_t,
-                        ems_valid_f32: ems_valid_t,
-                        items_valid_f32: items_valid_t,
-                    });
-                    (logits.detach(), values2.detach())
-                } else {
+                if !is_binpack {
                     for e in 0..local_num_envs {
                         let flat = flatten_obs(&cur_obs[e]);
                         let base = e * obs_dim;
                         obs_flat_all[base..base + obs_dim].copy_from_slice(&flat);
                     }
-                    let obs_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(obs_flat_all.clone(), [local_num_envs, obs_dim]),
-                        &device,
-                    );
+                }
 
-                    let (logits, values2) =
-                        agent.policy_value(PolicyInput::Dense { obs: obs_t });
-                    (logits.detach(), values2.detach())
-                };
+                let (logits, values2) = agent.policy_value(build_policy_input_batch::<B>(
+                    &cur_obs,
+                    model_kind,
+                    &args,
+                    obs_dim,
+                    &device,
+                )?);
+                let (logits, values2) = (logits.detach(), values2.detach());
                 let values = values2.reshape([local_num_envs]);
 
                 let actions_t = sample_actions_categorical::<B>(logits.clone(), mask_t.clone(), &device);
@@ -590,26 +499,22 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let rollout_elapsed = rollout_started.elapsed();
 
         let last_v2 = if is_binpack {
-            let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
-                build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
             agent
-                .critic_values(CriticInput::BinPack {
-                    ems: ems_t,
-                    items: items_t,
-                    ems_pad_mask: ems_pad_t,
-                    items_pad_mask: items_pad_t,
-                    ems_valid_f32: ems_valid_t,
-                    items_valid_f32: items_valid_t,
-                })
+                .critic_values(build_critic_input_batch::<B>(
+                    &cur_obs,
+                    model_kind,
+                    &args,
+                    obs_dim,
+                    &device,
+                )?)
                 .detach()
         } else {
             let obs_last = Tensor::<B, 2>::from_data(
                 TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
                 &device,
             );
-            agent
-                .critic_values(CriticInput::Dense { obs: obs_last })
-                .detach()
+            let policy_input = PolicyInput::Dense { obs: obs_last };
+            agent.policy_value(policy_input).1.detach()
         };
         let last_v = last_v2.reshape([local_num_envs]);
         let last_values: Vec<f32> = last_v.to_data().to_vec().unwrap();
@@ -664,56 +569,16 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             tgt_mb,
                         ) = roll.minibatch_binpack(mb_idx)?;
 
-                        let items_t = Tensor::<B, 3>::from_data(
-                            TensorData::new(items_mb, [mb_size, args.max_items, 3]),
+                        let policy_input = build_policy_input_from_binpack_parts::<B>(
+                            items_mb,
+                            ems_mb,
+                            items_valid_mb,
+                            ems_valid_mb,
+                            mb_size,
+                            &args,
                             &device,
                         );
-                        let ems_t = Tensor::<B, 3>::from_data(
-                            TensorData::new(ems_mb, [mb_size, args.max_ems, 6]),
-                            &device,
-                        );
-
-                        let mut items_pad_mb = vec![false; mb_size * args.max_items];
-                        let mut ems_pad_mb = vec![false; mb_size * args.max_ems];
-                        let mut items_valid_f32_mb = vec![0.0f32; mb_size * args.max_items];
-                        let mut ems_valid_f32_mb = vec![0.0f32; mb_size * args.max_ems];
-
-                        for i in 0..(mb_size * args.max_items) {
-                            let valid = items_valid_mb[i];
-                            items_pad_mb[i] = !valid;
-                            items_valid_f32_mb[i] = if valid { 1.0 } else { 0.0 };
-                        }
-                        for i in 0..(mb_size * args.max_ems) {
-                            let valid = ems_valid_mb[i];
-                            ems_pad_mb[i] = !valid;
-                            ems_valid_f32_mb[i] = if valid { 1.0 } else { 0.0 };
-                        }
-
-                        let items_pad_t = Tensor::<B, 2, Bool>::from_data(
-                            TensorData::new(items_pad_mb, [mb_size, args.max_items]),
-                            &device,
-                        );
-                        let ems_pad_t = Tensor::<B, 2, Bool>::from_data(
-                            TensorData::new(ems_pad_mb, [mb_size, args.max_ems]),
-                            &device,
-                        );
-                        let items_valid_t = Tensor::<B, 2>::from_data(
-                            TensorData::new(items_valid_f32_mb, [mb_size, args.max_items]),
-                            &device,
-                        );
-                        let ems_valid_t = Tensor::<B, 2>::from_data(
-                            TensorData::new(ems_valid_f32_mb, [mb_size, args.max_ems]),
-                            &device,
-                        );
-
-                        let (logits, v2) = agent.policy_value(PolicyInput::BinPack {
-                            ems: ems_t,
-                            items: items_t,
-                            ems_pad_mask: ems_pad_t,
-                            items_pad_mask: items_pad_t,
-                            ems_valid_f32: ems_valid_t,
-                            items_valid_f32: items_valid_t,
-                        });
+                        let (logits, v2) = agent.policy_value(policy_input);
 
                         let act_t = Tensor::<B, 1, Int>::from_data(
                             TensorData::new(act_mb, [mb_size]),
@@ -985,11 +850,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     args.seed + 999,
                     eval_num_envs,
                     args.num_eval_episodes,
-                    is_binpack,
+                    model_kind,
+                    &args,
                     obs_dim,
                     action_dim,
-                    args.max_items,
-                    args.max_ems,
                     &device,
                 )?;
 

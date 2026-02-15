@@ -1,14 +1,14 @@
 use anyhow::{bail, Result};
 use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
 use rand::distributions::{Distribution as RandDistribution, WeightedIndex};
 use rand::Rng;
 use rand_distr::Gamma;
 
+use crate::config::Args;
 use crate::env::{AsyncEnvPool, StepOut};
+use crate::env_model::{build_actor_input_batch, EnvModelKind};
 use crate::models::Agent;
 use crate::ppo::loss::sample_actions_categorical;
-use crate::spo::buffer::flatten_obs_once;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {
@@ -141,6 +141,8 @@ pub fn run_smc_search<B: Backend>(
     root_state_ids: &[i32],
     root_obs: &[rustpool::core::types::GenericObs],
     root_action_masks: &[Vec<bool>],
+    model_kind: EnvModelKind,
+    args: &Args,
     cfg: SearchConfig,
     obs_dim: usize,
     action_dim: usize,
@@ -184,25 +186,23 @@ pub fn run_smc_search<B: Backend>(
 
     for depth_idx in 0..cfg.search_depth {
         let n = current_obs.len();
-        let mut obs_flat = Vec::with_capacity(n * obs_dim);
         let mut mask_flat = Vec::with_capacity(n * action_dim);
-        for (obs, mask) in current_obs.iter().zip(current_masks.iter()) {
-            let obs_vec = flatten_obs_once(obs)?;
-            if obs_vec.len() != obs_dim {
-                bail!("search obs dim mismatch: got {}, expected {}", obs_vec.len(), obs_dim);
-            }
+        for mask in current_masks.iter() {
             if mask.len() != action_dim {
                 bail!("search action mask mismatch: got {}, expected {}", mask.len(), action_dim);
             }
-            obs_flat.extend_from_slice(&obs_vec);
             for &m in mask {
                 mask_flat.push(if m { 1.0 } else { 0.0 });
             }
         }
 
-        let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [n, obs_dim]), device);
-        let mask_t = Tensor::<B, 2>::from_data(TensorData::new(mask_flat, [n, action_dim]), device);
-        let logits = agent.actor.forward(obs_t);
+        let actor_input =
+            build_actor_input_batch::<B>(&current_obs, model_kind, args, obs_dim, device)?;
+        let logits = agent.actor_logits(actor_input);
+        let mask_t = burn::tensor::Tensor::<B, 2>::from_data(
+            burn::tensor::TensorData::new(mask_flat, [n, action_dim]),
+            device,
+        );
         let actions_t = sample_actions_categorical(logits, mask_t, device);
         let actions_data = actions_t.to_data();
         let actions = match actions_data.clone().to_vec::<i32>() {

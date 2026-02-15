@@ -10,8 +10,12 @@ use tracing::info;
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
+use crate::env_model::{
+    build_actor_input_batch, build_critic_input_batch, detect_env_model_from_metadata,
+    infer_obs_dim, EnvModelKind,
+};
 use crate::models::Agent;
-use crate::spo::buffer::{flatten_obs_once, ReplayBuffer};
+use crate::spo::buffer::ReplayBuffer;
 use crate::spo::loss::{compute_discrete_mpo_losses, MpoDuals};
 use crate::spo::search::{run_smc_search, SearchConfig};
 
@@ -46,6 +50,7 @@ fn run_search_eval<B: AutodiffBackend>(
     env_pool: &AsyncEnvPool,
     agent: &Agent<B>,
     args: &Args,
+    model_kind: EnvModelKind,
     obs_dim: usize,
     action_dim: usize,
     device: &B::Device,
@@ -84,6 +89,8 @@ fn run_search_eval<B: AutodiffBackend>(
             &root_state_ids,
             &cur_obs,
             &cur_masks,
+            model_kind,
+            args,
             SearchConfig {
                 num_particles: args.num_particles,
                 search_depth: args.search_depth,
@@ -199,6 +206,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         bail!("SPO currently supports Maze-v0 and BinPack-v0");
     }
 
+    let model_probe = make_env(&args.task_id, &args, args.seed)?;
+    let model_kind = detect_env_model_from_metadata(&*model_probe);
+
     let env_pool = AsyncEnvPool::new(args.num_envs, args.seed, {
         let task = args.task_id.clone();
         let args_clone = args.clone();
@@ -220,10 +230,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         .first()
         .ok_or_else(|| anyhow::anyhow!("reset returned no environments"))?;
 
-    let obs_dim = flatten_obs_once(&first_obs.obs)?.len();
+    let obs_dim = infer_obs_dim(&first_obs.obs, model_kind, &args);
     let action_dim = first_obs.action_mask.len();
 
-    let mut replay = ReplayBuffer::new(args.replay_buffer_size, obs_dim, action_dim);
+    let mut replay = ReplayBuffer::new(args.replay_buffer_size, action_dim);
 
     let mut agent_online = Agent::<B>::new(obs_dim, args.hidden_dim, action_dim, &device);
     let mut agent_target = agent_online.clone();
@@ -266,6 +276,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 &root_state_ids,
                 &cur_obs,
                 &cur_masks,
+                model_kind,
+                &args,
                 SearchConfig {
                     num_particles: args.num_particles,
                     search_depth: args.search_depth,
@@ -317,28 +329,36 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let sampled = replay.sample_random(args.num_envs, &mut rng);
                     let batch = sampled.actions.len();
 
-                    let obs_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(sampled.obs_flat.clone(), [batch, sampled.obs_dim]),
+                    let policy_logits = agent_online.actor_logits(build_actor_input_batch::<B>(
+                        &sampled.obs,
+                        model_kind,
+                        &args,
+                        obs_dim,
                         &device,
-                    );
-                    let next_obs_t = Tensor::<B, 2>::from_data(
-                        TensorData::new(sampled.next_obs_flat, [batch, sampled.obs_dim]),
-                        &device,
-                    );
-                    let policy_logits = agent_online.actor.forward(obs_t);
+                    )?);
                     let target_action_weights = Tensor::<B, 2>::from_data(
                         TensorData::new(sampled.root_action_weights, [batch, sampled.action_dim]),
                         &device,
                     );
 
-                    let values = agent_online.critic.forward(
-                        Tensor::<B, 2>::from_data(
-                            TensorData::new(sampled.obs_flat, [batch, sampled.obs_dim]),
+                    let values = agent_online
+                        .critic_values(build_critic_input_batch::<B>(
+                            &sampled.obs,
+                            model_kind,
+                            &args,
+                            obs_dim,
                             &device,
-                        ),
-                    )
-                    .reshape([batch]);
-                    let next_values = agent_target.critic.forward(next_obs_t).reshape([batch]);
+                        )?)
+                        .reshape([batch]);
+                    let next_values = agent_target
+                        .critic_values(build_critic_input_batch::<B>(
+                            &sampled.next_obs,
+                            model_kind,
+                            &args,
+                            obs_dim,
+                            &device,
+                        )?)
+                        .reshape([batch]);
 
                     let not_done = sampled
                         .dones
@@ -409,6 +429,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     eval_pool,
                     &agent_online,
                     &args,
+                    model_kind,
                     obs_dim,
                     action_dim,
                     &device,

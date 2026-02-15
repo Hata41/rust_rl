@@ -3,15 +3,14 @@ use rand::Rng;
 
 #[derive(Clone, Debug)]
 pub struct ReplayBatch {
-    pub obs_flat: Vec<f32>,
-    pub next_obs_flat: Vec<f32>,
+    pub obs: Vec<GenericObs>,
+    pub next_obs: Vec<GenericObs>,
     pub actions: Vec<i32>,
     pub rewards: Vec<f32>,
     pub dones: Vec<bool>,
     pub action_masks: Vec<bool>,
     pub next_action_masks: Vec<bool>,
     pub root_action_weights: Vec<f32>,
-    pub obs_dim: usize,
     pub action_dim: usize,
 }
 
@@ -20,10 +19,9 @@ pub struct ReplayBuffer {
     capacity: usize,
     len: usize,
     write_idx: usize,
-    obs_dim: usize,
     action_dim: usize,
-    obs_flat: Vec<f32>,
-    next_obs_flat: Vec<f32>,
+    obs: Vec<GenericObs>,
+    next_obs: Vec<GenericObs>,
     actions: Vec<i32>,
     rewards: Vec<f32>,
     dones: Vec<bool>,
@@ -33,15 +31,14 @@ pub struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
-    pub fn new(capacity: usize, obs_dim: usize, action_dim: usize) -> Self {
+    pub fn new(capacity: usize, action_dim: usize) -> Self {
         Self {
             capacity,
             len: 0,
             write_idx: 0,
-            obs_dim,
             action_dim,
-            obs_flat: vec![0.0; capacity * obs_dim],
-            next_obs_flat: vec![0.0; capacity * obs_dim],
+            obs: vec![Vec::new(); capacity],
+            next_obs: vec![Vec::new(); capacity],
             actions: vec![0; capacity],
             rewards: vec![0.0; capacity],
             dones: vec![false; capacity],
@@ -70,16 +67,6 @@ impl ReplayBuffer {
         next_action_mask: &[bool],
         root_action_weights: &[f32],
     ) -> anyhow::Result<()> {
-        let obs_flat = flatten_obs_once(obs)?;
-        let next_obs_flat = flatten_obs_once(next_obs)?;
-        if obs_flat.len() != self.obs_dim || next_obs_flat.len() != self.obs_dim {
-            anyhow::bail!(
-                "replay obs_dim mismatch: got ({}, {}), expected {}",
-                obs_flat.len(),
-                next_obs_flat.len(),
-                self.obs_dim
-            );
-        }
         if action_mask.len() != self.action_dim || next_action_mask.len() != self.action_dim {
             anyhow::bail!(
                 "replay action_dim mismatch: got ({}, {}), expected {}",
@@ -97,11 +84,10 @@ impl ReplayBuffer {
         }
 
         let idx = self.write_idx;
-        let o0 = idx * self.obs_dim;
         let m0 = idx * self.action_dim;
 
-        self.obs_flat[o0..o0 + self.obs_dim].copy_from_slice(&obs_flat);
-        self.next_obs_flat[o0..o0 + self.obs_dim].copy_from_slice(&next_obs_flat);
+    self.obs[idx] = obs.clone();
+    self.next_obs[idx] = next_obs.clone();
         self.actions[idx] = action;
         self.rewards[idx] = reward;
         self.dones[idx] = done;
@@ -124,8 +110,8 @@ impl ReplayBuffer {
 
     pub fn sample_random(&self, batch_size: usize, rng: &mut impl Rng) -> ReplayBatch {
         let batch = batch_size.min(self.len);
-        let mut obs_flat = Vec::with_capacity(batch * self.obs_dim);
-        let mut next_obs_flat = Vec::with_capacity(batch * self.obs_dim);
+        let mut obs = Vec::with_capacity(batch);
+        let mut next_obs = Vec::with_capacity(batch);
         let mut actions = Vec::with_capacity(batch);
         let mut rewards = Vec::with_capacity(batch);
         let mut dones = Vec::with_capacity(batch);
@@ -136,10 +122,9 @@ impl ReplayBuffer {
         let sampled = rand::seq::index::sample(rng, self.len, batch);
         for logical_idx in sampled.iter() {
             let idx = self.logical_to_physical_idx(logical_idx);
-            let o0 = idx * self.obs_dim;
             let m0 = idx * self.action_dim;
-            obs_flat.extend_from_slice(&self.obs_flat[o0..o0 + self.obs_dim]);
-            next_obs_flat.extend_from_slice(&self.next_obs_flat[o0..o0 + self.obs_dim]);
+            obs.push(self.obs[idx].clone());
+            next_obs.push(self.next_obs[idx].clone());
             actions.push(self.actions[idx]);
             rewards.push(self.rewards[idx]);
             dones.push(self.dones[idx]);
@@ -149,15 +134,14 @@ impl ReplayBuffer {
         }
 
         ReplayBatch {
-            obs_flat,
-            next_obs_flat,
+            obs,
+            next_obs,
             actions,
             rewards,
             dones,
             action_masks,
             next_action_masks,
             root_action_weights,
-            obs_dim: self.obs_dim,
             action_dim: self.action_dim,
         }
     }

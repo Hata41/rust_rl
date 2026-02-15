@@ -32,6 +32,7 @@ pub struct AsyncEnvPool {
     state_rx: Receiver<WorkerMessage>,
     message_buffer: Mutex<VecDeque<WorkerMessage>>,
     registry: StateRegistry,
+    active_state_ids: Mutex<HashSet<i32>>,
     live_state_ids: AtomicI64,
     worker_handles: Vec<thread::JoinHandle<()>>,
 }
@@ -83,6 +84,7 @@ impl AsyncEnvPool {
             state_rx,
             message_buffer: Mutex::new(VecDeque::new()),
             registry: StateRegistry::new(),
+            active_state_ids: Mutex::new(HashSet::new()),
             live_state_ids: AtomicI64::new(0),
             worker_handles,
         })
@@ -241,8 +243,21 @@ impl AsyncEnvPool {
             .collect::<Vec<_>>();
 
         let ids = self.registry.snapshot(ordered);
-        self.live_state_ids
-            .fetch_add(ids.len() as i64, Ordering::Relaxed);
+        {
+            let mut active = self
+                .active_state_ids
+                .lock()
+                .expect("active_state_ids mutex poisoned");
+            let mut inserted = 0i64;
+            for &id in ids.iter() {
+                if active.insert(id) {
+                    inserted += 1;
+                }
+            }
+            if inserted > 0 {
+                self.live_state_ids.fetch_add(inserted, Ordering::Relaxed);
+            }
+        }
         Ok(ids)
     }
 
@@ -278,8 +293,21 @@ impl AsyncEnvPool {
         }
 
         let new_state_ids = self.registry.snapshot(next_envs);
-        self.live_state_ids
-            .fetch_add(new_state_ids.len() as i64, Ordering::Relaxed);
+        {
+            let mut active = self
+                .active_state_ids
+                .lock()
+                .expect("active_state_ids mutex poisoned");
+            let mut inserted = 0i64;
+            for &id in new_state_ids.iter() {
+                if active.insert(id) {
+                    inserted += 1;
+                }
+            }
+            if inserted > 0 {
+                self.live_state_ids.fetch_add(inserted, Ordering::Relaxed);
+            }
+        }
         for (step, sid) in out.iter_mut().zip(new_state_ids.into_iter()) {
             step.state_ids.push(sid);
         }
@@ -288,11 +316,32 @@ impl AsyncEnvPool {
     }
 
     pub fn release_batch(&self, state_ids: &[i32]) {
-        self.registry.release(state_ids);
         if !state_ids.is_empty() {
-            let unique = state_ids.iter().copied().collect::<HashSet<_>>().len() as i64;
-            self.live_state_ids
-                .fetch_sub(unique, Ordering::Relaxed);
+            let unique_state_ids = state_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            self.registry.release(&unique_state_ids);
+
+            let removed = {
+                let mut active = self
+                    .active_state_ids
+                    .lock()
+                    .expect("active_state_ids mutex poisoned");
+                let mut removed = 0i64;
+                for id in unique_state_ids.iter() {
+                    if active.remove(id) {
+                        removed += 1;
+                    }
+                }
+                removed
+            };
+
+            if removed > 0 {
+                self.live_state_ids.fetch_sub(removed, Ordering::Relaxed);
+            }
         }
 
         #[cfg(debug_assertions)]
@@ -309,12 +358,15 @@ impl AsyncEnvPool {
 
 impl Drop for AsyncEnvPool {
     fn drop(&mut self) {
-        let live = self.live_state_ids.load(Ordering::Relaxed);
-        if live != 0 {
-            let cleared = self.registry.clear() as i64;
-            if cleared > 0 {
-                self.live_state_ids.fetch_sub(cleared, Ordering::Relaxed);
-            }
+        let remaining_ids = {
+            let active = self
+                .active_state_ids
+                .lock()
+                .expect("active_state_ids mutex poisoned");
+            active.iter().copied().collect::<Vec<_>>()
+        };
+        if !remaining_ids.is_empty() {
+            self.registry.release(&remaining_ids);
             self.live_state_ids.store(0, Ordering::Relaxed);
         }
 

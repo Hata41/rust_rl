@@ -24,7 +24,7 @@ pub fn logprob_and_entropy<Bk: burn::tensor::backend::Backend>(
     let idx2 = actions.reshape([bsz, 1]);
     let chosen_lp = lp.clone().gather(1, idx2).reshape([bsz]);
 
-    let ent = (probs * lp).sum_dim(1).neg().squeeze::<1>();
+    let ent = (probs * lp).sum_dim(1).neg().reshape([bsz]);
 
     (chosen_lp, ent)
 }
@@ -45,7 +45,7 @@ pub fn sample_actions_categorical<Bk: burn::tensor::backend::Backend>(
     );
     let cdf = probs.cumsum(1);
 
-    cdf.lower(u).int().sum_dim(1).squeeze::<1>()
+    cdf.lower(u).int().sum_dim(1).reshape([batch_size])
 }
 
 pub struct PpoLossParts<Bk: burn::tensor::backend::Backend> {
