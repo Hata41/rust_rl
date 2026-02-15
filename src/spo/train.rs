@@ -1,3 +1,4 @@
+use std::any::Any;
 use anyhow::{bail, Result};
 use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
@@ -174,28 +175,32 @@ fn run_search_eval<B: AutodiffBackend>(
 }
 
 struct FloatTensorCollector {
-    tensors: Vec<TensorData>,
+    tensors: Vec<Box<dyn Any>>,
 }
 
 impl<B: Backend> ModuleVisitor<B> for FloatTensorCollector {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-        self.tensors.push(param.val().to_data());
+        // Keep tensors on device and preserve typed shape information.
+        // This avoids host TensorData materialization during target-network updates.
+        self.tensors.push(Box::new(param.val()));
     }
 }
 
 struct SoftUpdateMapper {
     tau: f64,
-    online_tensors: VecDeque<TensorData>,
+    online_tensors: VecDeque<Box<dyn Any>>,
 }
 
 impl<B: Backend> ModuleMapper<B> for SoftUpdateMapper {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, target_tensor, mapper) = param.consume();
-        let online_data = self
+        let online_any = self
             .online_tensors
             .pop_front()
             .expect("online parameter stream exhausted during soft update");
-        let online_tensor = Tensor::<B, D>::from_data(online_data, &target_tensor.device());
+        let online_tensor = *online_any
+            .downcast::<Tensor<B, D>>()
+            .expect("online parameter type mismatch during soft update");
         let blended = target_tensor.mul_scalar((1.0 - self.tau) as f32)
             + online_tensor.mul_scalar(self.tau as f32);
         Param::from_mapped_value(id, blended, mapper)
@@ -207,6 +212,9 @@ where
     M: Module<B>,
     B: Backend,
 {
+    // Device-resident soft update stream:
+    // target <- (1 - tau) * target + tau * online
+    // without host synchronization on parameter tensors.
     let mut collector = FloatTensorCollector { tensors: Vec::new() };
     <M as Module<B>>::visit(online, &mut collector);
 
@@ -251,7 +259,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     let obs_dim = infer_obs_dim(&first_obs.obs, model_kind, &args);
     let action_dim = first_obs.action_mask.len();
 
-    let mut replay = ReplayBuffer::new(args.replay_buffer_size, args.num_envs, action_dim);
+    let mut replay = ReplayBuffer::new(
+        args.replay_buffer_size,
+        args.num_envs,
+        action_dim,
+        args.num_particles,
+    );
 
     let mut agent_online = Agent::<B>::new(obs_dim, args.hidden_dim, action_dim, &device);
     let mut agent_target = agent_online.clone();
@@ -387,6 +400,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 &action_masks,
                 &next_action_masks,
                 &search_out.root_action_weights,
+                &search_out.sampled_actions,
+                &search_out.sampled_advantages,
             )?;
             replay_add_duration_ms += replay_add_started.elapsed().as_secs_f64() * 1_000.0;
 
@@ -395,11 +410,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let rollout_elapsed = rollout_started.elapsed();
 
         let optimization_started = Instant::now();
-        let mut actor_loss_sum = 0.0f64;
-        let mut critic_loss_sum = 0.0f64;
-        let mut temp_loss_sum = 0.0f64;
-        let mut alpha_loss_sum = 0.0f64;
-        let mut mpo_total_loss_sum = 0.0f64;
+        // Accumulate metrics on-device and read back once per update to reduce host syncs.
+        let mut actor_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut critic_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut temp_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut alpha_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut mpo_total_loss_acc = Tensor::<B, 1>::zeros([1], &device);
         let mut optimization_updates = 0usize;
         let mut sample_duration_ms = 0.0f64;
         let mut model_forward_loss_duration_ms = 0.0f64;
@@ -433,6 +449,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         TensorData::new(sampled.root_action_weights, [batch, sampled.action_dim]),
                         &device,
                     );
+                    let sampled_advantages = Tensor::<B, 2>::from_data(
+                        TensorData::new(
+                            sampled.sampled_advantages,
+                            [batch, sampled.num_particles],
+                        ),
+                        &device,
+                    );
 
                     let values = agent_online
                         .critic_values(build_critic_input_batch::<B>(
@@ -443,7 +466,16 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             &device,
                         )?)
                         .reshape([batch]);
-                    let next_values = agent_target
+                    let target_v_tm1 = agent_target
+                        .critic_values(build_critic_input_batch::<B>(
+                            &sampled.obs,
+                            model_kind,
+                            &args,
+                            obs_dim,
+                            &device,
+                        )?)
+                        .reshape([batch]);
+                    let target_v_t = agent_target
                         .critic_values(build_critic_input_batch::<B>(
                             &sampled.next_obs,
                             model_kind,
@@ -453,20 +485,39 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         )?)
                         .reshape([batch]);
 
-                    let not_done = sampled
-                        .dones
-                        .iter()
-                        .map(|d| if *d { 0.0f32 } else { 1.0f32 })
-                        .collect::<Vec<_>>();
-                    let reward_t =
-                        Tensor::<B, 1>::from_data(TensorData::new(sampled.rewards, [batch]), &device);
-                    let not_done_t =
-                        Tensor::<B, 1>::from_data(TensorData::new(not_done, [batch]), &device);
-                    let critic_targets = reward_t + next_values.detach() * not_done_t * args.gamma;
+                    let target_v_tm1_vec = target_v_tm1
+                        .clone()
+                        .to_data()
+                        .to_vec::<f32>()
+                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_tm1: {e}"))?;
+                    let target_v_t_vec = target_v_t
+                        .detach()
+                        .to_data()
+                        .to_vec::<f32>()
+                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_t: {e}"))?;
+
+                    let mut target_values = vec![0.0f32; batch];
+                    let sequence_len = args.sample_sequence_length;
+                    let num_sequences = batch / sequence_len;
+                    for sequence_idx in 0..num_sequences {
+                        let mut gae = 0.0f32;
+                        for t in (0..sequence_len).rev() {
+                            let i = sequence_idx * sequence_len + t;
+                            let not_done = if sampled.dones[i] { 0.0 } else { 1.0 };
+                            let delta = sampled.rewards[i]
+                                + args.gamma * not_done * target_v_t_vec[i]
+                                - target_v_tm1_vec[i];
+                            gae = delta + args.gamma * args.gae_lambda * not_done * gae;
+                            target_values[i] = gae + target_v_tm1_vec[i];
+                        }
+                    }
+                    let critic_targets =
+                        Tensor::<B, 1>::from_data(TensorData::new(target_values, [batch]), &device);
 
                     let parts = compute_discrete_mpo_losses(
                         policy_logits,
                         target_action_weights,
+                        sampled_advantages,
                         values,
                         critic_targets,
                         &duals,
@@ -499,47 +550,11 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     backward_step_duration_ms +=
                         backward_started.elapsed().as_secs_f64() * 1_000.0;
 
-                    let actor_loss = parts
-                        .actor_loss
-                        .to_data()
-                        .to_vec::<f32>()
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0.0) as f64;
-                    let critic_loss = parts
-                        .critic_loss
-                        .to_data()
-                        .to_vec::<f32>()
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0.0) as f64;
-                    let temp_loss = parts
-                        .loss_temperature
-                        .to_data()
-                        .to_vec::<f32>()
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0.0) as f64;
-                    let alpha_loss = parts
-                        .loss_alpha
-                        .to_data()
-                        .to_vec::<f32>()
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0.0) as f64;
-                    let mpo_total_loss = parts
-                        .total_loss
-                        .to_data()
-                        .to_vec::<f32>()
-                        .ok()
-                        .and_then(|v| v.into_iter().next())
-                        .unwrap_or(0.0) as f64;
-
-                    actor_loss_sum += actor_loss;
-                    critic_loss_sum += critic_loss;
-                    temp_loss_sum += temp_loss;
-                    alpha_loss_sum += alpha_loss;
-                    mpo_total_loss_sum += mpo_total_loss;
+                    actor_loss_acc = actor_loss_acc + parts.actor_loss.detach();
+                    critic_loss_acc = critic_loss_acc + parts.critic_loss.detach();
+                    temp_loss_acc = temp_loss_acc + parts.loss_temperature.detach();
+                    alpha_loss_acc = alpha_loss_acc + parts.loss_alpha.detach();
+                    mpo_total_loss_acc = mpo_total_loss_acc + parts.total_loss.detach();
                     optimization_updates += 1;
                 }
             }
@@ -548,6 +563,37 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
         if is_lead {
             let denom = (optimization_updates as f64).max(1.0);
+            let actor_loss_sum = actor_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or(0.0) as f64;
+            let critic_loss_sum = critic_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or(0.0) as f64;
+            let temp_loss_sum = temp_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or(0.0) as f64;
+            let alpha_loss_sum = alpha_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or(0.0) as f64;
+            let mpo_total_loss_sum = mpo_total_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .unwrap_or(0.0) as f64;
+
             let mean_actor_loss = actor_loss_sum / denom;
             let mean_critic_loss = critic_loss_sum / denom;
             let mean_temp_loss = temp_loss_sum / denom;

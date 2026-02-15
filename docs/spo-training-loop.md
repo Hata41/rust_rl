@@ -45,6 +45,8 @@ and produces:
 
 - `root_actions`: sampled actions for live env step
 - `root_action_weights`: per-env action distribution target from search particles
+- `sampled_actions`: root-depth sampled particle actions (for dual-temperature optimization)
+- `sampled_advantages`: particle-level search advantages (for dual-temperature optimization)
 - `leaf_state_ids`: simulated states requiring release
 
 ### SMC mechanics currently implemented
@@ -72,9 +74,13 @@ Stored transition payload:
 Optimization uses sampled replay mini-batches:
 
 - actor target: search-derived root action weights
-- critic target: TD-style target using target critic on next observations
+- critic target: sequence-wise GAE-style target computed from target critic predictions
 - dual updates: temperature and alpha losses
 - online target sync: soft update with `tau`
+
+The current SPO path intentionally keeps `simulate_batch` parallelized in the env layer while
+moving additional search work (`per-env weighting` and `per-env resampling`) into Rayon-parallel
+chunks at the search layer.
 
 ## Target network update semantics
 
@@ -83,6 +89,11 @@ Optimization uses sampled replay mini-batches:
 - `target = (1 - tau) * target + tau * online`
 
 This executes each optimizer step during SPO optimization.
+
+Implementation note:
+
+- The soft update path is device-resident (typed tensor stream) to avoid host tensor
+   materialization in each optimizer step.
 
 ## Evaluation phase contract
 
@@ -167,6 +178,18 @@ Main SPO cost centers:
 
 - `num_particles * search_depth`
 - replay sampling and repeated forward/backward passes
+
+Recent optimizations (implemented):
+
+- Full per-env resampling/weighting parallelization in search.
+- Per-depth temporary buffer reuse for mask flattening and transition chunk flattening.
+- Device-side training metric accumulation with one scalar readback per update.
+- Device-resident target-network soft update path (host-sync reduction).
+
+Reproducibility note:
+
+- Parallel per-env resampling uses per-env RNG seeds to avoid shared mutable RNG contention.
+   This improves throughput but may change exact RNG ordering versus fully sequential search.
 
 Scaling guidance:
 

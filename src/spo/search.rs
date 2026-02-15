@@ -1,8 +1,11 @@
 use anyhow::{bail, Result};
 use burn::tensor::backend::Backend;
+use rand::rngs::StdRng;
 use rand::distributions::{Distribution as RandDistribution, WeightedIndex};
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use rand_distr::Gamma;
+use rayon::prelude::*;
+use rustpool::core::types::GenericObs;
 
 use crate::config::Args;
 use crate::env::{AsyncEnvPool, StepOut};
@@ -27,8 +30,20 @@ pub struct SearchConfig {
 pub struct SearchOut {
     pub root_actions: Vec<i32>,
     pub root_action_weights: Vec<f32>,
+    pub sampled_actions: Vec<i32>,
+    pub sampled_advantages: Vec<f32>,
     pub leaf_steps: Vec<StepOut>,
     pub leaf_state_ids: Vec<i32>,
+}
+
+struct EnvTransitionChunk {
+    state_ids: Vec<i32>,
+    obs: Vec<GenericObs>,
+    masks: Vec<Vec<bool>>,
+    td_weights: Vec<f32>,
+    gae: Vec<f32>,
+    terminal: Vec<bool>,
+    weights: Vec<f32>,
 }
 
 fn softmax(values: &[f32]) -> Vec<f32> {
@@ -187,11 +202,14 @@ pub fn run_smc_search<B: Backend>(
     let mut particle_terminal = vec![false; batch * cfg.num_particles];
     let mut particle_weights = vec![1.0f32 / (cfg.num_particles as f32); batch * cfg.num_particles];
 
-    let mut logits_buf = vec![0.0f32; cfg.num_particles];
+    // Reused scratch buffer for action masks across search depths.
+    // We keep this allocation outside the depth loop to reduce allocator pressure.
+    let mut mask_flat = Vec::with_capacity(batch * cfg.num_particles * action_dim);
 
     for depth_idx in 0..cfg.search_depth {
         let n = current_obs.len();
-        let mut mask_flat = Vec::with_capacity(n * action_dim);
+        mask_flat.clear();
+        mask_flat.reserve(n * action_dim);
         for mask in current_masks.iter() {
             if mask.len() != action_dim {
                 bail!("search action mask mismatch: got {}, expected {}", mask.len(), action_dim);
@@ -218,8 +236,10 @@ pub fn run_smc_search<B: Backend>(
             .map_err(|e| anyhow::anyhow!("failed to convert current values: {e}"))?;
 
         let logits = agent.actor_logits(actor_input);
+        // Burn's TensorData constructor takes ownership; cloning here keeps the reusable
+        // scratch vector available for the next depth iteration.
         let mask_t = burn::tensor::Tensor::<B, 2>::from_data(
-            burn::tensor::TensorData::new(mask_flat, [n, action_dim]),
+            burn::tensor::TensorData::new(mask_flat.clone(), [n, action_dim]),
             device,
         );
         let actions_t = sample_actions_categorical(logits, mask_t, device);
@@ -266,32 +286,111 @@ pub fn run_smc_search<B: Backend>(
             particle_terminal[i] = particle_terminal[i] || steps[i].done;
         }
 
-        for env_idx in 0..batch {
-            let start = env_idx * cfg.num_particles;
-            let end = start + cfg.num_particles;
-            let td_weights = &particle_td_weights[start..end];
-            let temperature = if cfg.adaptive_temperature {
-                let mean = td_weights.iter().sum::<f32>() / cfg.num_particles as f32;
-                let var = td_weights
-                    .iter()
-                    .map(|r| {
-                        let d = *r - mean;
-                        d * d
-                    })
-                    .sum::<f32>()
-                    / cfg.num_particles as f32;
-                var.sqrt().max(1.0e-3)
-            } else {
-                cfg.fixed_temperature.max(1.0e-3)
-            };
-            for (i, &w) in td_weights.iter().enumerate() {
-                logits_buf[i] = w / temperature;
-            }
-            let w = softmax(&logits_buf);
-            particle_weights[start..end].copy_from_slice(&w);
-        }
+        // Per-environment normalization is independent, so we parallelize over env chunks.
+        particle_weights
+            .par_chunks_mut(cfg.num_particles)
+            .enumerate()
+            .for_each(|(env_idx, weights_out)| {
+                let start = env_idx * cfg.num_particles;
+                let end = start + cfg.num_particles;
+                let td_weights = &particle_td_weights[start..end];
+                let temperature = if cfg.adaptive_temperature {
+                    let mean = td_weights.iter().sum::<f32>() / cfg.num_particles as f32;
+                    let var = td_weights
+                        .iter()
+                        .map(|r| {
+                            let d = *r - mean;
+                            d * d
+                        })
+                        .sum::<f32>()
+                        / cfg.num_particles as f32;
+                    var.sqrt().max(1.0e-3)
+                } else {
+                    cfg.fixed_temperature.max(1.0e-3)
+                };
+
+                let mut logits_buf = vec![0.0f32; cfg.num_particles];
+                for (i, &w) in td_weights.iter().enumerate() {
+                    logits_buf[i] = w / temperature;
+                }
+                let weights = softmax(&logits_buf);
+                weights_out.copy_from_slice(&weights);
+            });
 
         if depth_idx + 1 < cfg.search_depth {
+            let periodic_trigger =
+                cfg.resampling_period > 0 && (depth_idx + 1) % cfg.resampling_period == 0;
+            // Generate deterministic per-env seeds serially, then run each env transition in
+            // parallel with its own local RNG. This avoids mutable RNG contention in Rayon tasks.
+            let env_seeds = (0..batch).map(|_| rng.gen::<u64>()).collect::<Vec<_>>();
+
+            // Build per-env transition chunks in parallel, then flatten once.
+            // This keeps ownership simple while still parallelizing resampling-heavy work.
+            let chunk_results = (0..batch)
+                .into_par_iter()
+                .map(|env_idx| -> Result<EnvTransitionChunk> {
+                    let start = env_idx * cfg.num_particles;
+                    let end = start + cfg.num_particles;
+                    let w = &particle_weights[start..end];
+                    let ess = effective_sample_size(w);
+                    let ess_trigger = ess < cfg.resampling_ess_threshold * cfg.num_particles as f32;
+                    let do_resample = periodic_trigger || ess_trigger;
+
+                    let mut chunk = EnvTransitionChunk {
+                        state_ids: Vec::with_capacity(cfg.num_particles),
+                        obs: Vec::with_capacity(cfg.num_particles),
+                        masks: Vec::with_capacity(cfg.num_particles),
+                        td_weights: Vec::with_capacity(cfg.num_particles),
+                        gae: Vec::with_capacity(cfg.num_particles),
+                        terminal: Vec::with_capacity(cfg.num_particles),
+                        weights: Vec::with_capacity(cfg.num_particles),
+                    };
+
+                    if do_resample {
+                        let mut local_rng = StdRng::seed_from_u64(env_seeds[env_idx]);
+                        let sampled = resample_indices(w, cfg.num_particles, &mut local_rng);
+                        for &j in sampled.iter() {
+                            let idx = start + j;
+                            chunk.state_ids.push(
+                                steps[idx]
+                                    .state_ids
+                                    .first()
+                                    .copied()
+                                    .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                            );
+                            chunk.obs.push(steps[idx].obs.clone());
+                            chunk.masks.push(steps[idx].action_mask.clone());
+                            chunk.td_weights.push(0.0);
+                            chunk.gae.push(particle_gae[idx]);
+                            chunk.terminal.push(particle_terminal[idx]);
+                        }
+                        let uniform = 1.0 / cfg.num_particles as f32;
+                        for _ in 0..cfg.num_particles {
+                            chunk.weights.push(uniform);
+                        }
+                    } else {
+                        for idx in start..end {
+                            chunk.state_ids.push(
+                                steps[idx]
+                                    .state_ids
+                                    .first()
+                                    .copied()
+                                    .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                            );
+                            chunk.obs.push(steps[idx].obs.clone());
+                            chunk.masks.push(steps[idx].action_mask.clone());
+                            chunk.td_weights.push(particle_td_weights[idx]);
+                            chunk.gae.push(particle_gae[idx]);
+                            chunk.terminal.push(particle_terminal[idx]);
+                            chunk.weights.push(particle_weights[idx]);
+                        }
+                    }
+
+                    Ok(chunk)
+                })
+                .collect::<Vec<_>>();
+
+            // Flatten chunked outputs with exact-capacity vectors to avoid repeated reallocations.
             let mut next_state_ids = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_obs = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_masks = Vec::with_capacity(batch * cfg.num_particles);
@@ -300,53 +399,15 @@ pub fn run_smc_search<B: Backend>(
             let mut next_terminal = Vec::with_capacity(batch * cfg.num_particles);
             let mut next_weights = Vec::with_capacity(batch * cfg.num_particles);
 
-            for env_idx in 0..batch {
-                let start = env_idx * cfg.num_particles;
-                let end = start + cfg.num_particles;
-                let w = &particle_weights[start..end];
-                let ess = effective_sample_size(w);
-                let periodic_trigger =
-                    cfg.resampling_period > 0 && (depth_idx + 1) % cfg.resampling_period == 0;
-                let ess_trigger = ess < cfg.resampling_ess_threshold * cfg.num_particles as f32;
-
-                if periodic_trigger || ess_trigger {
-                    let sampled = resample_indices(w, cfg.num_particles, rng);
-                    for &j in sampled.iter() {
-                        let idx = start + j;
-                        next_state_ids.push(
-                            steps[idx]
-                                .state_ids
-                                .first()
-                                .copied()
-                                .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
-                        );
-                        next_obs.push(steps[idx].obs.clone());
-                        next_masks.push(steps[idx].action_mask.clone());
-                        next_td_weights.push(0.0);
-                        next_gae.push(particle_gae[idx]);
-                        next_terminal.push(particle_terminal[idx]);
-                    }
-                    let uniform = 1.0 / cfg.num_particles as f32;
-                    for _ in 0..cfg.num_particles {
-                        next_weights.push(uniform);
-                    }
-                } else {
-                    for idx in start..end {
-                        next_state_ids.push(
-                            steps[idx]
-                                .state_ids
-                                .first()
-                                .copied()
-                                .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
-                        );
-                        next_obs.push(steps[idx].obs.clone());
-                        next_masks.push(steps[idx].action_mask.clone());
-                        next_td_weights.push(particle_td_weights[idx]);
-                        next_gae.push(particle_gae[idx]);
-                        next_terminal.push(particle_terminal[idx]);
-                        next_weights.push(particle_weights[idx]);
-                    }
-                }
+            for chunk_result in chunk_results {
+                let chunk = chunk_result?;
+                next_state_ids.extend(chunk.state_ids);
+                next_obs.extend(chunk.obs);
+                next_masks.extend(chunk.masks);
+                next_td_weights.extend(chunk.td_weights);
+                next_gae.extend(chunk.gae);
+                next_terminal.extend(chunk.terminal);
+                next_weights.extend(chunk.weights);
             }
 
             let mut released = current_state_ids.clone();
@@ -423,6 +484,8 @@ pub fn run_smc_search<B: Backend>(
     Ok(SearchOut {
         root_actions,
         root_action_weights,
+        sampled_actions: root_particle_actions,
+        sampled_advantages: particle_gae,
         leaf_steps: last_steps,
         leaf_state_ids,
     })

@@ -29,6 +29,12 @@ Inside one update, the effective sequence is:
 8. PPO losses + backward + optimizer step
 9. telemetry + optional deterministic eval
 
+Performance note:
+
+- PPO training now accumulates minibatch scalar metrics (actor loss, critic loss, entropy)
+  on device and performs a single readback per update cycle.
+  This reduces host/device synchronization overhead in tight optimization loops.
+
 ## Where to edit for specific behavior
 
 - Change sampling behavior -> `src/ppo/loss.rs` + rollout action path in `train.rs`.

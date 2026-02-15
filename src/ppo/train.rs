@@ -524,9 +524,11 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let mb_size = local_batch / args.num_minibatches;
         let mut all_indices: Vec<usize> = (0..local_batch).collect();
 
-        let mut actor_loss_sum = 0.0f64;
-        let mut critic_loss_sum = 0.0f64;
-        let mut entropy_sum = 0.0f64;
+        // Keep scalar metric accumulation on device and fetch once per update.
+        // This reduces minibatch-level host/device synchronization overhead.
+        let mut actor_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut critic_loss_acc = Tensor::<B, 1>::zeros([1], &device);
+        let mut entropy_acc = Tensor::<B, 1>::zeros([1], &device);
         let mut grad_norm_sum = 0.0f64;
         let mut optimization_data_prep_duration_ms = 0.0f64;
         let mut optimization_forward_loss_duration_ms = 0.0f64;
@@ -685,37 +687,36 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     optimization_backward_step_duration_ms +=
                         backward_step_started.elapsed().as_secs_f64() * 1_000.0;
 
-                    let actor_loss = parts
-                        .actor_loss
-                        .to_data()
-                        .to_vec::<f32>()
-                        .unwrap_or_default()
-                        .first()
-                        .copied()
-                        .unwrap_or(0.0);
-                    let critic_loss = parts
-                        .value_loss
-                        .to_data()
-                        .to_vec::<f32>()
-                        .unwrap_or_default()
-                        .first()
-                        .copied()
-                        .unwrap_or(0.0);
-                    let entropy = parts
-                        .entropy_mean
-                        .to_data()
-                        .to_vec::<f32>()
-                        .unwrap_or_default()
-                        .first()
-                        .copied()
-                        .unwrap_or(0.0);
-
-                    actor_loss_sum += actor_loss as f64;
-                    critic_loss_sum += critic_loss as f64;
-                    entropy_sum += entropy as f64;
+                    actor_loss_acc = actor_loss_acc + parts.actor_loss.clone().detach();
+                    critic_loss_acc = critic_loss_acc + parts.value_loss.clone().detach();
+                    entropy_acc = entropy_acc + parts.entropy_mean.clone().detach();
                     grad_norm_sum += global_grad_norm as f64;
 
                     if is_lead {
+                        let actor_loss = parts
+                            .actor_loss
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        let critic_loss = parts
+                            .value_loss
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
+                        let entropy = parts
+                            .entropy_mean
+                            .to_data()
+                            .to_vec::<f32>()
+                            .unwrap_or_default()
+                            .first()
+                            .copied()
+                            .unwrap_or(0.0);
                         debug!(
                             category = "TRAINER",
                             update,
@@ -737,6 +738,27 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         if is_lead {
             let num_updates_in_cycle = (args.epochs * args.num_minibatches) as f64;
             let denom = num_updates_in_cycle.max(1.0);
+            let actor_loss_sum = actor_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0) as f64;
+            let critic_loss_sum = critic_loss_acc
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0) as f64;
+            let entropy_sum = entropy_acc
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap_or_default()
+                .first()
+                .copied()
+                .unwrap_or(0.0) as f64;
             let mean_actor_loss = actor_loss_sum / denom;
             let mean_critic_loss = critic_loss_sum / denom;
             let mean_entropy = entropy_sum / denom;

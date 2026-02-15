@@ -20,7 +20,7 @@ training_core:
   rollout_length: 8
   num_updates: 20
   epochs: 1
-  num_minibatches: 4
+  num_minibatches: 1
   gamma: 0.99
 
 optimization:
@@ -43,8 +43,8 @@ hardware:
   cuda_device: 0
 
 spo:
-  num_particles: 4
-  search_depth: 2
+  num_particles: 8
+  search_depth: 4
   replay_buffer_size: 512
   sample_sequence_length: 8
   sample_period: 1

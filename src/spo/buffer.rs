@@ -12,7 +12,10 @@ pub struct ReplayBatch {
     pub action_masks: Vec<bool>,
     pub next_action_masks: Vec<bool>,
     pub root_action_weights: Vec<f32>,
+    pub sampled_actions: Vec<i32>,
+    pub sampled_advantages: Vec<f32>,
     pub action_dim: usize,
+    pub num_particles: usize,
 }
 
 #[derive(Debug)]
@@ -22,6 +25,7 @@ pub struct ReplayBuffer {
     current_index: usize,
     is_full: bool,
     action_dim: usize,
+    num_particles: usize,
     obs: Vec<Arc<GenericObs>>,
     next_obs: Vec<Arc<GenericObs>>,
     actions: Vec<i32>,
@@ -30,11 +34,14 @@ pub struct ReplayBuffer {
     action_masks: Vec<bool>,
     next_action_masks: Vec<bool>,
     root_action_weights: Vec<f32>,
+    sampled_actions: Vec<i32>,
+    sampled_advantages: Vec<f32>,
 }
 
 impl ReplayBuffer {
-    pub fn new(capacity: usize, add_batch_size: usize, action_dim: usize) -> Self {
+    pub fn new(capacity: usize, add_batch_size: usize, action_dim: usize, num_particles: usize) -> Self {
         assert!(add_batch_size > 0, "add_batch_size must be > 0");
+        assert!(num_particles > 0, "num_particles must be > 0");
         let max_length_time_axis = (capacity / add_batch_size).max(1);
         let slots = add_batch_size * max_length_time_axis;
 
@@ -44,6 +51,7 @@ impl ReplayBuffer {
             current_index: 0,
             is_full: false,
             action_dim,
+            num_particles,
             obs: vec![Arc::new(Vec::new()); slots],
             next_obs: vec![Arc::new(Vec::new()); slots],
             actions: vec![0; slots],
@@ -52,6 +60,8 @@ impl ReplayBuffer {
             action_masks: vec![false; slots * action_dim],
             next_action_masks: vec![false; slots * action_dim],
             root_action_weights: vec![0.0; slots * action_dim],
+            sampled_actions: vec![0; slots * num_particles],
+            sampled_advantages: vec![0.0; slots * num_particles],
         }
     }
 
@@ -86,6 +96,8 @@ impl ReplayBuffer {
         action_masks: &[&[bool]],
         next_action_masks: &[&[bool]],
         root_action_weights: &[f32],
+        sampled_actions: &[i32],
+        sampled_advantages: &[f32],
     ) -> anyhow::Result<()> {
         if obs_batch.len() != self.add_batch_size
             || next_obs_batch.len() != self.add_batch_size
@@ -116,6 +128,21 @@ impl ReplayBuffer {
             );
         }
 
+        if sampled_actions.len() != self.add_batch_size * self.num_particles {
+            anyhow::bail!(
+                "replay sampled_actions mismatch: got {}, expected {}",
+                sampled_actions.len(),
+                self.add_batch_size * self.num_particles
+            );
+        }
+        if sampled_advantages.len() != self.add_batch_size * self.num_particles {
+            anyhow::bail!(
+                "replay sampled_advantages mismatch: got {}, expected {}",
+                sampled_advantages.len(),
+                self.add_batch_size * self.num_particles
+            );
+        }
+
         let write_time = self.current_index;
         for env_idx in 0..self.add_batch_size {
             if action_masks[env_idx].len() != self.action_dim
@@ -133,6 +160,8 @@ impl ReplayBuffer {
             let idx = self.idx(env_idx, write_time);
             let m0 = idx * self.action_dim;
             let rw0 = env_idx * self.action_dim;
+            let p0 = idx * self.num_particles;
+            let ps0 = env_idx * self.num_particles;
 
             self.obs[idx] = Arc::new((*obs_batch[env_idx]).clone());
             self.next_obs[idx] = Arc::new((*next_obs_batch[env_idx]).clone());
@@ -144,6 +173,10 @@ impl ReplayBuffer {
                 .copy_from_slice(&next_action_masks[env_idx]);
             self.root_action_weights[m0..m0 + self.action_dim]
                 .copy_from_slice(&root_action_weights[rw0..rw0 + self.action_dim]);
+            self.sampled_actions[p0..p0 + self.num_particles]
+                .copy_from_slice(&sampled_actions[ps0..ps0 + self.num_particles]);
+            self.sampled_advantages[p0..p0 + self.num_particles]
+                .copy_from_slice(&sampled_advantages[ps0..ps0 + self.num_particles]);
         }
 
         let next_index = self.current_index + 1;
@@ -170,7 +203,10 @@ impl ReplayBuffer {
                 action_masks: Vec::new(),
                 next_action_masks: Vec::new(),
                 root_action_weights: Vec::new(),
+                sampled_actions: Vec::new(),
+                sampled_advantages: Vec::new(),
                 action_dim: self.action_dim,
+                num_particles: self.num_particles,
             };
         }
 
@@ -191,7 +227,10 @@ impl ReplayBuffer {
                 action_masks: Vec::new(),
                 next_action_masks: Vec::new(),
                 root_action_weights: Vec::new(),
+                sampled_actions: Vec::new(),
+                sampled_advantages: Vec::new(),
                 action_dim: self.action_dim,
+                num_particles: self.num_particles,
             };
         }
 
@@ -207,6 +246,8 @@ impl ReplayBuffer {
         let mut action_masks = Vec::with_capacity(batch * self.action_dim);
         let mut next_action_masks = Vec::with_capacity(batch * self.action_dim);
         let mut root_action_weights = Vec::with_capacity(batch * self.action_dim);
+        let mut sampled_actions = Vec::with_capacity(batch * self.num_particles);
+        let mut sampled_advantages = Vec::with_capacity(batch * self.num_particles);
 
         for _ in 0..num_sequences {
             let sampled_item_idx = if num_valid_items == 1 {
@@ -237,6 +278,10 @@ impl ReplayBuffer {
                     .extend_from_slice(&self.next_action_masks[m0..m0 + self.action_dim]);
                 root_action_weights
                     .extend_from_slice(&self.root_action_weights[m0..m0 + self.action_dim]);
+                let p0 = idx * self.num_particles;
+                sampled_actions.extend_from_slice(&self.sampled_actions[p0..p0 + self.num_particles]);
+                sampled_advantages
+                    .extend_from_slice(&self.sampled_advantages[p0..p0 + self.num_particles]);
             }
         }
 
@@ -249,7 +294,10 @@ impl ReplayBuffer {
             action_masks,
             next_action_masks,
             root_action_weights,
+            sampled_actions,
+            sampled_advantages,
             action_dim: self.action_dim,
+            num_particles: self.num_particles,
         }
     }
 }

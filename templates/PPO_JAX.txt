@@ -1,0 +1,3776 @@
+This file is a merged representation of a subset of the codebase, containing specifically included files, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Only files matching these patterns are included: stoix/systems/ppo/anakin/ff_ppo.py, stoix/systems/ppo/ppo_types.py, stoix/base_types.py, stoix/utils/loss.py, stoix/utils/multistep.py, stoix/utils/jax_utils.py, stoix/utils/training.py, stoix/utils/running_statistics.py, stoix/networks/base.py, stoix/networks/torso.py, stoix/networks/heads.py, stoix/networks/inputs.py, stoix/networks/distributions.py, stoix/networks/utils.py, stoix/configs/system/ppo/ff_ppo.yaml, stoix/configs/arch/anakin.yaml, stoix/configs/network/mlp.yaml
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+stoix/
+  configs/
+    arch/
+      anakin.yaml
+    network/
+      mlp.yaml
+    system/
+      ppo/
+        ff_ppo.yaml
+  networks/
+    base.py
+    distributions.py
+    heads.py
+    inputs.py
+    torso.py
+    utils.py
+  systems/
+    ppo/
+      anakin/
+        ff_ppo.py
+      ppo_types.py
+  utils/
+    jax_utils.py
+    loss.py
+    multistep.py
+    running_statistics.py
+    training.py
+  base_types.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="stoix/utils/loss.py">
+from typing import Tuple
+
+import chex
+import jax
+import jax.numpy as jnp
+import rlax
+import tensorflow_probability.substrates.jax as tfp
+from tensorflow_probability.substrates.jax.distributions import Distribution
+
+tfd = tfp.distributions
+
+# These losses are generally taken from rlax but edited to explicitly take in a batch of data.
+# This is because the original rlax losses are not batched and are meant to be used with vmap,
+# which is much slower.
+
+
+def ppo_clip_loss(
+    pi_log_prob_t: chex.Array, b_pi_log_prob_t: chex.Array, gae_t: chex.Array, epsilon: float
+) -> chex.Array:
+    ratio = jnp.exp(pi_log_prob_t - b_pi_log_prob_t)
+    loss_actor1 = ratio * gae_t
+    loss_actor2 = (
+        jnp.clip(
+            ratio,
+            1.0 - epsilon,
+            1.0 + epsilon,
+        )
+        * gae_t
+    )
+    loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
+    loss_actor = loss_actor.mean()
+    return loss_actor
+
+
+def ppo_penalty_loss(
+    pi_log_prob_t: chex.Array,
+    b_pi_log_prob_t: chex.Array,
+    gae_t: chex.Array,
+    beta: float,
+    pi: Distribution,
+    b_pi: Distribution,
+) -> Tuple[chex.Array, chex.Array]:
+    ratio = jnp.exp(pi_log_prob_t - b_pi_log_prob_t)
+    kl_div = b_pi.kl_divergence(pi).mean()
+    objective = ratio * gae_t - beta * kl_div
+    loss_actor = -objective.mean()
+    return loss_actor, kl_div
+
+
+def dpo_loss(
+    pi_log_prob_t: chex.Array,
+    b_pi_log_prob_t: chex.Array,
+    gae_t: chex.Array,
+    alpha: float,
+    beta: float,
+) -> chex.Array:
+    log_diff = pi_log_prob_t - b_pi_log_prob_t
+    ratio = jnp.exp(log_diff)
+    is_pos = (gae_t >= 0.0).astype(jnp.float32)
+    r1 = ratio - 1.0
+    drift1 = jax.nn.relu(r1 * gae_t - alpha * jax.nn.tanh(r1 * gae_t / alpha))
+    drift2 = jax.nn.relu(log_diff * gae_t - beta * jax.nn.tanh(log_diff * gae_t / beta))
+    drift = drift1 * is_pos + drift2 * (1 - is_pos)
+    loss_actor = -(ratio * gae_t - drift).mean()
+    return loss_actor
+
+
+def clipped_value_loss(
+    pred_value_t: chex.Array, behavior_value_t: chex.Array, targets_t: chex.Array, epsilon: float
+) -> chex.Array:
+    value_pred_clipped = behavior_value_t + (pred_value_t - behavior_value_t).clip(
+        -epsilon, epsilon
+    )
+    value_losses = jnp.square(pred_value_t - targets_t)
+    value_losses_clipped = jnp.square(value_pred_clipped - targets_t)
+    value_loss = 0.5 * jnp.maximum(value_losses, value_losses_clipped).mean()
+
+    return value_loss
+
+
+def categorical_double_q_learning(
+    q_logits_tm1: chex.Array,
+    q_atoms_tm1: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    q_logits_t: chex.Array,
+    q_atoms_t: chex.Array,
+    q_t_selector: chex.Array,
+) -> chex.Array:
+    """Computes the categorical double Q-learning loss. Each input is a batch."""
+    batch_indices = jnp.arange(a_tm1.shape[0])
+    # Scale and shift time-t distribution atoms by discount and reward.
+    target_z = r_t[:, jnp.newaxis] + d_t[:, jnp.newaxis] * q_atoms_t
+    # Select logits for greedy action in state s_t and convert to distribution.
+    p_target_z = jax.nn.softmax(q_logits_t[batch_indices, q_t_selector.argmax(-1)])
+    # Project using the Cramer distance and maybe stop gradient flow to targets.
+    target = jax.vmap(rlax.categorical_l2_project)(target_z, p_target_z, q_atoms_tm1)
+    # Compute loss (i.e. temporal difference error).
+    logit_qa_tm1 = q_logits_tm1[batch_indices, a_tm1]
+    td_error = tfd.Categorical(probs=target).cross_entropy(tfd.Categorical(logits=logit_qa_tm1))
+
+    return td_error
+
+
+def q_learning(
+    q_tm1: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    q_t: chex.Array,
+    huber_loss_parameter: chex.Array,
+) -> jnp.ndarray:
+    """Computes the double Q-learning loss. Each input is a batch."""
+    batch_indices = jnp.arange(a_tm1.shape[0])
+    # Compute Q-learning n-step TD-error.
+    target_tm1 = r_t + d_t * jnp.max(q_t, axis=-1)
+    td_error = target_tm1 - q_tm1[batch_indices, a_tm1]
+    if huber_loss_parameter > 0.0:
+        batch_loss = rlax.huber_loss(td_error, huber_loss_parameter)
+    else:
+        batch_loss = rlax.l2_loss(td_error)
+
+    return jnp.mean(batch_loss)
+
+
+def double_q_learning(
+    q_tm1: chex.Array,
+    q_t_value: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    q_t_selector: chex.Array,
+    huber_loss_parameter: chex.Array,
+) -> jnp.ndarray:
+    """Computes the double Q-learning loss. Each input is a batch."""
+    batch_indices = jnp.arange(a_tm1.shape[0])
+    # Compute double Q-learning n-step TD-error.
+    target_tm1 = r_t + d_t * q_t_value[batch_indices, q_t_selector.argmax(-1)]
+    td_error = target_tm1 - q_tm1[batch_indices, a_tm1]
+    if huber_loss_parameter > 0.0:
+        batch_loss = rlax.huber_loss(td_error, huber_loss_parameter)
+    else:
+        batch_loss = rlax.l2_loss(td_error)
+
+    return jnp.mean(batch_loss)
+
+
+def td_learning(
+    v_tm1: chex.Array,
+    r_t: chex.Array,
+    discount_t: chex.Array,
+    v_t: chex.Array,
+    huber_loss_parameter: chex.Array,
+) -> chex.Array:
+    """Calculates the temporal difference error. Each input is a batch."""
+    target_tm1 = r_t + discount_t * v_t
+    td_errors = target_tm1 - v_tm1
+    if huber_loss_parameter > 0.0:
+        batch_loss = rlax.huber_loss(td_errors, huber_loss_parameter)
+    else:
+        batch_loss = rlax.l2_loss(td_errors)
+    return jnp.mean(batch_loss)
+
+
+def categorical_td_learning(
+    v_logits_tm1: chex.Array,
+    v_atoms_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    v_logits_t: chex.Array,
+    v_atoms_t: chex.Array,
+) -> chex.Array:
+    """Implements TD-learning for categorical value distributions. Each input is a batch."""
+
+    # Scale and shift time-t distribution atoms by discount and reward.
+    target_z = r_t[:, jnp.newaxis] + d_t[:, jnp.newaxis] * v_atoms_t
+
+    # Convert logits to distribution.
+    v_t_probs = jax.nn.softmax(v_logits_t)
+
+    # Project using the Cramer distance and maybe stop gradient flow to targets.
+    target = jax.vmap(rlax.categorical_l2_project)(target_z, v_t_probs, v_atoms_tm1)
+
+    td_error = tfd.Categorical(probs=target).cross_entropy(tfd.Categorical(logits=v_logits_tm1))
+
+    return jnp.mean(td_error)
+
+
+def munchausen_q_learning(
+    q_tm1: chex.Array,
+    q_tm1_target: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    q_t_target: chex.Array,
+    entropy_temperature: chex.Array,
+    munchausen_coefficient: chex.Array,
+    clip_value_min: chex.Array,
+    huber_loss_parameter: chex.Array,
+) -> chex.Array:
+    action_one_hot = jax.nn.one_hot(a_tm1, q_tm1.shape[-1])
+    q_tm1_a = jnp.sum(q_tm1 * action_one_hot, axis=-1)
+    # Compute double Q-learning loss.
+    # Munchausen term : tau * log_pi(a|s)
+    munchausen_term = entropy_temperature * jax.nn.log_softmax(
+        q_tm1_target / entropy_temperature, axis=-1
+    )
+    munchausen_term_a = jnp.sum(action_one_hot * munchausen_term, axis=-1)
+    munchausen_term_a = jnp.clip(munchausen_term_a, a_min=clip_value_min, a_max=0.0)
+
+    # Soft Bellman operator applied to q
+    next_v = entropy_temperature * jax.nn.logsumexp(q_t_target / entropy_temperature, axis=-1)
+    target_q = jax.lax.stop_gradient(
+        r_t + munchausen_coefficient * munchausen_term_a + d_t * next_v
+    )
+    td_error = target_q - q_tm1_a
+    if huber_loss_parameter > 0.0:
+        batch_loss = rlax.huber_loss(td_error, huber_loss_parameter)
+    else:
+        batch_loss = rlax.l2_loss(td_error)
+    batch_loss = jnp.mean(batch_loss)
+    return batch_loss
+
+
+def quantile_regression_loss(
+    dist_src: chex.Array,
+    tau_src: chex.Array,
+    dist_target: chex.Array,
+    huber_param: float = 0.0,
+) -> chex.Array:
+    """Compute (Huber) QR loss between two discrete quantile-valued distributions.
+
+    See "Distributional Reinforcement Learning with Quantile Regression" by
+    Dabney et al. (https://arxiv.org/abs/1710.10044).
+
+    Args:
+        dist_src: source probability distribution.
+        tau_src: source distribution probability thresholds.
+        dist_target: target probability distribution.
+        huber_param: Huber loss parameter, defaults to 0 (no Huber loss).
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+        Quantile regression loss.
+    """
+
+    batch_indices = jnp.arange(dist_src.shape[0])
+
+    # Calculate quantile error.
+    delta = dist_target[batch_indices, None, :] - dist_src[batch_indices, :, None]
+    delta_neg = (delta < 0.0).astype(jnp.float32)
+    delta_neg = jax.lax.stop_gradient(delta_neg)
+    weight = jnp.abs(tau_src[batch_indices, :, None] - delta_neg)
+
+    # Calculate Huber loss.
+    if huber_param > 0.0:
+        loss = rlax.huber_loss(delta, huber_param)
+    else:
+        loss = jnp.abs(delta)
+    loss *= weight
+
+    # Average over target-samples dimension, sum over src-samples dimension.
+    return jnp.sum(jnp.mean(loss, axis=-1), axis=-1)
+
+
+def quantile_q_learning(
+    dist_q_tm1: chex.Array,
+    tau_q_tm1: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    dist_q_t_selector: chex.Array,
+    dist_q_t: chex.Array,
+    huber_param: float = 0.0,
+) -> chex.Array:
+    """Implements Q-learning for quantile-valued Q distributions.
+
+    See "Distributional Reinforcement Learning with Quantile Regression" by
+    Dabney et al. (https://arxiv.org/abs/1710.10044).
+
+    Args:
+        dist_q_tm1: Q distribution at time t-1.
+        tau_q_tm1: Q distribution probability thresholds.
+        a_tm1: action index at time t-1.
+        r_t: reward at time t.
+        d_t: discount at time t.
+        dist_q_t_selector: Q distribution at time t for selecting greedy action in
+        target policy. This is separate from dist_q_t as in Double Q-Learning, but
+        can be computed with the target network and a separate set of samples.
+        dist_q_t: target Q distribution at time t.
+        huber_param: Huber loss parameter, defaults to 0 (no Huber loss).
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+        Quantile regression Q learning loss.
+    """
+    batch_indices = jnp.arange(a_tm1.shape[0])
+
+    # Only update the taken actions.
+    dist_qa_tm1 = dist_q_tm1[batch_indices, :, a_tm1]
+
+    # Select target action according to greedy policy w.r.t. dist_q_t_selector.
+    q_t_selector = jnp.mean(dist_q_t_selector, axis=1)
+    a_t = jnp.argmax(q_t_selector, axis=-1)
+    dist_qa_t = dist_q_t[batch_indices, :, a_t]
+
+    # Compute target, do not backpropagate into it.
+    dist_target = r_t[:, jnp.newaxis] + d_t[:, jnp.newaxis] * dist_qa_t
+    dist_target = jax.lax.stop_gradient(dist_target)
+
+    return quantile_regression_loss(dist_qa_tm1, tau_q_tm1, dist_target, huber_param).mean()
+</file>
+
+<file path="stoix/utils/training.py">
+from typing import Callable, Optional, Union
+
+from omegaconf import DictConfig
+
+
+def make_learning_rate_schedule(
+    init_lr: float, num_updates: int, num_epochs: int, num_minibatches: int
+) -> Callable:
+    """Makes a very simple linear learning rate scheduler.
+
+    Args:
+        init_lr: initial learning rate.
+        num_updates: number of updates.
+        num_epochs: number of epochs.
+        num_minibatches: number of minibatches.
+
+    Note:
+        We use a simple linear learning rate scheduler based on the suggestions from a blog on PPO
+        implementation details which can be viewed at http://tinyurl.com/mr3chs4p
+        This function can be extended to have more complex learning rate schedules by adding any
+        relevant arguments to the system config and then parsing them accordingly here.
+    """
+
+    def linear_scedule(count: int) -> float:
+        frac: float = 1.0 - (count // (num_epochs * num_minibatches)) / num_updates
+        return init_lr * frac
+
+    return linear_scedule
+
+
+def make_learning_rate(
+    init_lr: float, config: DictConfig, num_epochs: int, num_minibatches: Optional[int] = None
+) -> Union[float, Callable]:
+    """Returns a constant learning rate or a learning rate schedule.
+
+    Args:
+        init_lr: initial learning rate.
+        config: system configuration.
+        num_epochs: number of epochs.
+        num_minibatches: number of minibatches.
+
+    Returns:
+        A learning rate schedule or fixed learning rate.
+    """
+    if num_minibatches is None:
+        num_minibatches = 1
+
+    if config.system.decay_learning_rates:
+        return make_learning_rate_schedule(
+            init_lr, config.arch.num_updates, num_epochs, num_minibatches
+        )
+    else:
+        return init_lr
+</file>
+
+<file path="stoix/networks/distributions.py">
+from typing import Any, Optional, Sequence
+
+import chex
+import distrax
+import jax
+import jax.numpy as jnp
+import numpy as np
+import tensorflow_probability.substrates.jax as tfp
+from tensorflow_probability.substrates.jax.distributions import (
+    Beta,
+    Categorical,
+    Distribution,
+    TransformedDistribution,
+)
+
+tfb = tfp.bijectors
+
+
+class AffineTanhTransformedDistribution(TransformedDistribution):
+    """Distribution followed by tanh and then affine transformations."""
+
+    def __init__(
+        self,
+        distribution: Distribution,
+        minimum: float,
+        maximum: float,
+        epsilon: float = 1e-3,
+        validate_args: bool = False,
+    ) -> None:
+        """Initialize the distribution with a tanh and affine bijector.
+
+        Args:
+          distribution: The distribution to transform.
+          minimum: Lower bound of the target range.
+          maximum: Upper bound of the target range.
+          epsilon: epsilon value for numerical stability.
+            epsilon is used to compute the log of the average probability distribution
+            outside the clipping range, i.e. on the interval
+            [-inf, atanh(inverse_affine(minimum))] for log_prob_left and
+            [atanh(inverse_affine(maximum)), inf] for log_prob_right.
+          validate_args: Passed to super class.
+        """
+        # Calculate scale and shift for the affine transformation to achieve the range
+        # [minimum, maximum] after the tanh.
+        scale = (maximum - minimum) / 2.0
+        shift = (minimum + maximum) / 2.0
+
+        # Chain the bijectors
+        joint_bijector = tfb.Chain([tfb.Shift(shift), tfb.Scale(scale), tfb.Tanh()])
+
+        super().__init__(
+            distribution=distribution, bijector=joint_bijector, validate_args=validate_args
+        )
+
+        # Computes the log of the average probability distribution outside the
+        # clipping range, i.e. on the interval [-inf, atanh(inverse_affine(minimum))] for
+        # log_prob_left and [atanh(inverse_affine(maximum)), inf] for log_prob_right.
+        self._min_threshold = minimum + epsilon
+        self._max_threshold = maximum - epsilon
+        min_inverse_threshold = self.bijector.inverse(self._min_threshold)
+        max_inverse_threshold = self.bijector.inverse(self._max_threshold)
+        # average(pdf) = p/epsilon
+        # So log(average(pdf)) = log(p) - log(epsilon)
+        log_epsilon = jnp.log(epsilon)
+        # Those 2 values are differentiable w.r.t. model parameters, such that the
+        # gradient is defined everywhere.
+        self._log_prob_left = self.distribution.log_cdf(min_inverse_threshold) - log_epsilon
+        self._log_prob_right = (
+            self.distribution.log_survival_function(max_inverse_threshold) - log_epsilon
+        )
+
+    def log_prob(self, event: chex.Array) -> chex.Array:
+        # Without this clip there would be NaNs in the inner tf.where and that
+        # causes issues for some reasons.
+        event = jnp.clip(event, self._min_threshold, self._max_threshold)
+        return jnp.where(
+            event <= self._min_threshold,
+            self._log_prob_left,
+            jnp.where(event >= self._max_threshold, self._log_prob_right, super().log_prob(event)),
+        )
+
+    def mode(self) -> chex.Array:
+        return self.bijector.forward(self.distribution.mode())
+
+    def entropy(self, seed: chex.PRNGKey = None) -> chex.Array:
+        return self.distribution.entropy() + self.bijector.forward_log_det_jacobian(
+            self.distribution.sample(seed=seed), event_ndims=0
+        )
+
+    @classmethod
+    def _parameter_properties(cls, dtype: Optional[Any], num_classes: Any = None) -> Any:
+        td_properties = super()._parameter_properties(dtype, num_classes=num_classes)
+        del td_properties["bijector"]
+        return td_properties
+
+
+class ClippedBeta(Beta):
+    """Beta distribution with clipped samples."""
+
+    def sample(
+        self,
+        sample_shape: Sequence[int] = (),
+        seed: Optional[chex.PRNGKey] = None,
+        name: str = "sample",
+        **kwargs: Any
+    ) -> chex.Array:
+        _epsilon = 1e-7
+        # Call the original sample method
+        sample = super().sample(sample_shape, seed, name, **kwargs)
+        # Clip the sample to avoid being too close to 0 and 1
+        # This is important for numerical stability
+        clipped_sample = jnp.clip(sample, _epsilon, 1 - _epsilon)
+        return clipped_sample
+
+
+class DiscreteValuedTfpDistribution(Categorical):
+    """This is a generalization of a categorical distribution.
+
+    The support for the DiscreteValued distribution can be any real valued range,
+    whereas the categorical distribution has support [0, n_categories - 1] or
+    [1, n_categories]. This generalization allows us to take the mean of the
+    distribution over its support.
+    """
+
+    def __init__(
+        self,
+        values: chex.Array,
+        logits: Optional[chex.Array] = None,
+        probs: Optional[chex.Array] = None,
+        name: str = "DiscreteValuedDistribution",
+    ):
+        """Initialization.
+
+        Args:
+          values: Values making up support of the distribution. Should have a shape
+            compatible with logits.
+          logits: An N-D Tensor, N >= 1, representing the log probabilities of a set
+            of Categorical distributions. The first N - 1 dimensions index into a
+            batch of independent distributions and the last dimension indexes into
+            the classes.
+          probs: An N-D Tensor, N >= 1, representing the probabilities of a set of
+            Categorical distributions. The first N - 1 dimensions index into a batch
+            of independent distributions and the last dimension represents a vector
+            of probabilities for each class. Only one of logits or probs should be
+            passed in.
+          name: Name of the distribution object.
+        """
+        parameters = dict(locals())
+        self._values = np.asarray(values)
+        self._logits: Optional[chex.Array] = None
+        self._probs: Optional[chex.Array] = None
+
+        if logits is not None:
+            logits = jnp.asarray(logits)
+            chex.assert_shape(logits, (..., *self._values.shape))
+
+        if probs is not None:
+            probs = jnp.asarray(probs)
+            chex.assert_shape(probs, (..., *self._values.shape))
+
+        super().__init__(logits=logits, probs=probs, name=name)
+
+        self._parameters = parameters
+
+    @property
+    def values(self) -> chex.Array:
+        return self._values
+
+    @property
+    def logits(self) -> chex.Array:
+        if self._logits is None:
+            self._logits = jax.nn.log_softmax(self._probs)
+        return self._logits
+
+    @property
+    def probs(self) -> chex.Array:
+        if self._probs is None:
+            self._probs = jax.nn.softmax(self._logits)
+        return self._probs
+
+    @classmethod
+    def _parameter_properties(cls, dtype: np.dtype, num_classes: Any = None) -> Any:
+        return {
+            "values": tfp.util.ParameterProperties(
+                event_ndims=None, shape_fn=lambda shape: (num_classes,), specifies_shape=True
+            ),
+            "logits": tfp.util.ParameterProperties(event_ndims=1),
+            "probs": tfp.util.ParameterProperties(event_ndims=1, is_preferred=False),
+        }
+
+    def _sample_n(self, key: chex.PRNGKey, n: int) -> chex.Array:
+        indices = super()._sample_n(key=key, n=n)
+        return jnp.take_along_axis(self._values, indices, axis=-1)
+
+    def mean(self) -> chex.Array:
+        """Overrides the Categorical mean by incorporating category values."""
+        return jnp.sum(self.probs_parameter() * self._values, axis=-1)
+
+    def variance(self) -> chex.Array:
+        """Overrides the Categorical variance by incorporating category values."""
+        dist_squared = jnp.square(jnp.expand_dims(self.mean(), -1) - self._values)
+        return jnp.sum(self.probs_parameter() * dist_squared, axis=-1)
+
+    def _event_shape(self) -> chex.Array:
+        return jnp.zeros((), dtype=jnp.int32)
+
+    def _event_shape_tensor(self) -> chex.Array:
+        return []
+
+
+class MultiDiscreteActionDistribution(distrax.Distribution):
+    """A multi discrete action distribution where each discrete
+        subspace can have a different number of dimensions.
+
+    Copied from Kinetix.
+    """
+
+    def __init__(self, flat_logits: chex.Array, number_of_dims_per_distribution: list[int]) -> None:
+        self.distributions = []
+        total_dims = 0
+        for dims in number_of_dims_per_distribution:
+            self.distributions.append(
+                distrax.Categorical(logits=flat_logits[..., total_dims : total_dims + dims])
+            )
+            total_dims += dims
+
+    def _sample_n(self, key: chex.PRNGKey, n: int) -> Any:
+        rngs = jax.random.split(key, len(self.distributions))
+        samples = [
+            jnp.expand_dims(d._sample_n(rng, n), axis=-1)
+            for rng, d in zip(rngs, self.distributions)
+        ]
+        return jnp.concatenate(samples, axis=-1)
+
+    def log_prob(self, value: Any) -> chex.Array:
+        return sum(d.log_prob(value[..., i]) for i, d in enumerate(self.distributions))
+
+    def entropy(self) -> chex.Array:
+        return sum(d.entropy() for d in self.distributions)
+
+    def event_shape(self) -> Sequence[int]:
+        return ()
+</file>
+
+<file path="stoix/networks/inputs.py">
+import chex
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+
+
+class ArrayInput(nn.Module):
+    """JAX Array Input. Used for any input that is already a JAX array."""
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+        return embedding
+
+
+class FeatureInput(nn.Module):
+    """Used for inputs that are specific attributes of some observation type."""
+
+    feature_name: str
+
+    @nn.compact
+    def __call__(self, input_object: chex.ArrayTree) -> chex.Array:
+        embedding = getattr(input_object, self.feature_name)
+        return embedding
+
+
+class EmbeddingActionInput(nn.Module):
+    """Observation/Embedding and Action Input."""
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array, action: chex.Array) -> chex.Array:
+        """Concatenates observation/embedding and action."""
+        x = jnp.concatenate([embedding, action], axis=-1)
+        return x
+
+
+class EmbeddingActionOnehotInput(nn.Module):
+    """Observation/Embedding and Action One-hot Input."""
+
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, observation_embedding: chex.Array, action: chex.Array) -> chex.Array:
+        action_one_hot = jax.nn.one_hot(action, self.action_dim)
+        x = jnp.concatenate([observation_embedding, action_one_hot], axis=-1)
+        return x
+</file>
+
+<file path="stoix/networks/utils.py">
+from typing import Callable, Dict
+
+import chex
+from flax import linen as nn
+
+
+def parse_activation_fn(activation_fn_name: str) -> Callable[[chex.Array], chex.Array]:
+    """Get the activation function."""
+    activation_fns: Dict[str, Callable[[chex.Array], chex.Array]] = {
+        "relu": nn.relu,
+        "tanh": nn.tanh,
+        "silu": nn.silu,
+        "elu": nn.elu,
+        "gelu": nn.gelu,
+        "sigmoid": nn.sigmoid,
+        "softplus": nn.softplus,
+        "swish": nn.swish,
+        "identity": lambda x: x,
+        "none": lambda x: x,
+        "normalise": nn.standardize,
+        "softmax": nn.softmax,
+        "log_softmax": nn.log_softmax,
+        "log_sigmoid": nn.log_sigmoid,
+    }
+    return activation_fns[activation_fn_name]
+
+
+def parse_rnn_cell(rnn_cell_name: str) -> nn.RNNCellBase:
+    """Get the rnn cell."""
+    rnn_cells: Dict[str, Callable[[chex.Array], chex.Array]] = {
+        "lstm": nn.LSTMCell,
+        "optimised_lstm": nn.OptimizedLSTMCell,
+        "gru": nn.GRUCell,
+        "mgu": nn.MGUCell,
+        "simple": nn.SimpleCell,
+    }
+    return rnn_cells[rnn_cell_name]
+</file>
+
+<file path="stoix/systems/ppo/ppo_types.py">
+from typing import Dict
+
+import chex
+from typing_extensions import NamedTuple
+
+from stoix.base_types import Action, ActorCriticHiddenStates, Done, Truncated, Value
+
+
+class PPOTransition(NamedTuple):
+    """Transition tuple for PPO."""
+
+    done: Done
+    truncated: Truncated
+    action: Action
+    value: Value
+    reward: chex.Array
+    bootstrap_value: Value
+    log_prob: chex.Array
+    obs: chex.Array
+    info: Dict
+
+
+class RNNPPOTransition(NamedTuple):
+    """Transition tuple for PPO."""
+
+    done: Done
+    truncated: Truncated
+    action: Action
+    value: Value
+    reward: chex.Array
+    log_prob: chex.Array
+    obs: chex.Array
+    hstates: ActorCriticHiddenStates
+    info: Dict
+</file>
+
+<file path="stoix/utils/running_statistics.py">
+"""
+Utility functions to compute running statistics.
+Taken and modified from
+Acme https://github.com/google-deepmind/acme/blob/master/acme/jax/running_statistics.py
+"""
+
+import dataclasses
+import types
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+import tree
+from jax import Array
+
+Path = Tuple[Any, ...]
+"""Path in a nested structure.
+
+  A path is a tuple of indices (normally strings for maps and integers for
+  arrays and tuples) that uniquely identifies a subtree in the nested structure.
+  See
+  https://tree.readthedocs.io/en/latest/api.html#tree.map_structure_with_path
+  for more details.
+"""
+
+
+def fast_map_structure(func: Callable, *structure: chex.ArrayTree) -> chex.ArrayTree:
+    """Faster map_structure implementation which skips some error checking."""
+    flat_structure = (tree.flatten(s) for s in structure)
+    entries = zip(*flat_structure)
+    # Arbitrarily choose one of the structures of the original sequence (the last)
+    # to match the structure for the flattened sequence.
+    return tree.unflatten_as(structure[-1], [func(*x) for x in entries])
+
+
+def fast_map_structure_with_path(func: Callable, *structure: chex.ArrayTree) -> chex.ArrayTree:
+    """Faster map_structure_with_path implementation."""
+    head_entries_with_path = tree.flatten_with_path(structure[0])
+    if len(structure) > 1:
+        tail_entries = (tree.flatten(s) for s in structure[1:])
+        entries_with_path = [e[0] + e[1:] for e in zip(head_entries_with_path, *tail_entries)]
+    else:
+        entries_with_path = head_entries_with_path
+    # Arbitrarily choose one of the structures of the original sequence (the last)
+    # to match the structure for the flattened sequence.
+    return tree.unflatten_as(structure[-1], [func(*x) for x in entries_with_path])
+
+
+def _psum_over_axes(value: Array, pmap_axis_names: Optional[Sequence[str]]) -> Array:
+    """Apply psum over multiple axes sequentially."""
+    if pmap_axis_names is None:
+        return value
+
+    result = value
+    for axis_name in pmap_axis_names:
+        result = jax.lax.psum(result, axis_name=axis_name)
+    return result
+
+
+def _is_prefix(a: Path, b: Path) -> bool:
+    """Returns whether `a` is a prefix of `b`."""
+    return b[: len(a)] == a
+
+
+def _zeros_like(nest: chex.ArrayTree, dtype: Optional[jnp.dtype] = None) -> chex.ArrayTree:
+    return jax.tree_util.tree_map(lambda x: jnp.zeros(x.shape, dtype or x.dtype), nest)
+
+
+def _ones_like(nest: chex.ArrayTree, dtype: Optional[jnp.dtype] = None) -> chex.ArrayTree:
+    return jax.tree_util.tree_map(lambda x: jnp.ones(x.shape, dtype or x.dtype), nest)
+
+
+@chex.dataclass(frozen=True)
+class NestedMeanStd:
+    """A container for running statistics (mean, std) of possibly nested data."""
+
+    mean: chex.ArrayTree
+    std: chex.ArrayTree
+
+
+@chex.dataclass(frozen=True)
+class RunningStatisticsState(NestedMeanStd):
+    """Full state of running statistics computation."""
+
+    count: Union[int, Array]
+    summed_variance: chex.ArrayTree
+
+
+@dataclasses.dataclass(frozen=True)
+class NestStatisticsConfig:
+    """Specifies how to compute statistics for Nests with the same structure.
+
+    Attributes:
+      paths: A sequence of Nest paths to compute statistics for. If there is a
+        collision between paths (one is a prefix of the other), the shorter path
+        takes precedence.
+    """
+
+    paths: Tuple[Path, ...] = ((),)
+
+
+def _is_path_included(config: NestStatisticsConfig, path: Path) -> bool:
+    """Returns whether the path is included in the config."""
+    # A path is included in the config if it corresponds to a tree node that
+    # belongs to a subtree rooted at the node corresponding to some path in
+    # the config.
+    return any(_is_prefix(config_path, path) for config_path in config.paths)
+
+
+def initialize_statistics(nest: chex.ArrayTree) -> RunningStatisticsState:
+    """Initializes the running statistics for the given nested structure."""
+    dtype: jnp.dtype = jnp.float64 if jax.config.jax_enable_x64 else jnp.float32
+
+    return RunningStatisticsState(  # type: ignore
+        count=0.0,
+        mean=_zeros_like(nest, dtype=dtype),
+        summed_variance=_zeros_like(nest, dtype=dtype),
+        # Initialize with ones to make sure normalization works correctly
+        # in the initial state.
+        std=_ones_like(nest, dtype=dtype),
+    )
+
+
+def initialize_statistics_from_data(
+    nest: chex.ArrayTree,
+    data_sample: chex.ArrayTree,
+    *,
+    config: Optional[NestStatisticsConfig] = None,
+    weights: Optional[Array] = None,
+    std_min_value: float = 5e-4,
+    std_max_value: float = 5e4,
+    pmap_axes: Optional[Union[str, Sequence[str]]] = None,
+    validate_shapes: bool = True,
+) -> RunningStatisticsState:
+    """Initializes the running statistics for the given nested structure from a data sample."""
+    if config is None:
+        config = NestStatisticsConfig()
+    init_running_statistics = initialize_statistics(nest)
+    return update_statistics(
+        state=init_running_statistics,
+        batch=data_sample,
+        config=config,
+        weights=weights,
+        std_min_value=std_min_value,
+        std_max_value=std_max_value,
+        pmap_axes=pmap_axes,
+        validate_shapes=validate_shapes,
+    )
+
+
+def _validate_batch_shapes(
+    batch: chex.ArrayTree, reference_sample: chex.ArrayTree, batch_dims: Tuple[int, ...]
+) -> None:
+    """Verifies shapes of the batch leaves against the reference sample.
+
+    Checks that batch dimensions are the same in all leaves in the batch.
+    Checks that non-batch dimensions for all leaves in the batch are the same
+    as in the reference sample.
+
+    Arguments:
+      batch: the nested batch of data to be verified.
+      reference_sample: the nested array to check non-batch dimensions.
+      batch_dims: a Tuple of indices of batch dimensions in the batch shape.
+
+    Returns:
+      None.
+    """
+
+    def validate_node_shape(reference_sample: Array, batch: Array) -> None:
+        expected_shape: Tuple[int, ...] = batch_dims + reference_sample.shape
+        assert batch.shape == expected_shape, f"{batch.shape} != {expected_shape}"
+
+    fast_map_structure(validate_node_shape, reference_sample, batch)
+
+
+def convert_pmap_axes_names(
+    pmap_axes: Optional[Union[str, Sequence[str]]]
+) -> Optional[Sequence[str]]:
+    """Converts pmap axes names to a list of strings."""
+    # Handle multiple pmap axes
+    pmap_axis_names: Optional[Sequence[str]] = None
+    if pmap_axes is not None:
+        if isinstance(pmap_axes, str):
+            pmap_axis_names = [pmap_axes]
+        else:
+            pmap_axis_names = list(pmap_axes)
+
+    return pmap_axis_names
+
+
+def update_statistics(
+    state: RunningStatisticsState,
+    batch: chex.ArrayTree,
+    *,
+    config: Optional[NestStatisticsConfig] = None,
+    weights: Optional[Array] = None,
+    std_min_value: float = 1e-6,
+    std_max_value: float = 1e6,
+    pmap_axes: Optional[Union[str, Sequence[str]]] = None,
+    validate_shapes: bool = True,
+) -> RunningStatisticsState:
+    """Updates the running statistics with the given batch of data.
+
+    Note: data batch and state elements (mean, etc.) must have the same structure.
+
+    Note: by default will use int32 for counts and float32 for accumulated
+    variance. This results in an integer overflow after 2^31 data points and
+    degrading precision after 2^24 batch updates or even earlier if variance
+    updates have large dynamic range.
+    To improve precision, consider setting jax_enable_x64 to True, see
+    https://jax.readthedocs.io/en/latest/notebooks/Common_Gotchas_in_JAX.html#double-64bit-precision
+
+    Examples:
+      # Single pmap axis
+      updated_state = update(state, batch, pmap_axes='device')
+
+      # Multiple pmap axes
+      updated_state = update(state, batch, pmap_axes=['device', 'batch'])
+
+    Arguments:
+      state: The running statistics before the update.
+      batch: The data to be used to update the running statistics.
+      config: The config that specifies which leaves of the nested structure
+        should the running statistics be computed for.
+      weights: Weights of the batch data. Should match the batch dimensions.
+        Passing a weight of 2. should be equivalent to updating on the
+        corresponding data point twice.
+      std_min_value: Minimum value for the standard deviation.
+      std_max_value: Maximum value for the standard deviation.
+      pmap_axes: Name(s) of the pmapped axis/axes. Can be a single string or a
+        sequence of strings for multiple axes (e.g., ['device', 'batch']).
+      validate_shapes: If true, the shapes of all leaves of the batch will be
+        validated. Enabled by default. Doesn't impact performance when jitted.
+
+    Returns:
+      Updated running statistics.
+    """
+    if config is None:
+        config = NestStatisticsConfig()
+    # We require exactly the same structure to avoid issues when flattened
+    # batch and state have different order of elements.
+    tree.assert_same_structure(batch, state.mean)
+    batch_shape: Tuple[int, ...] = tree.flatten(batch)[0].shape
+    # We assume the batch dimensions always go first.
+    batch_dims: Tuple[int, ...] = batch_shape[: len(batch_shape) - tree.flatten(state.mean)[0].ndim]
+    batch_axis: range = range(len(batch_dims))
+
+    # # Handle multiple pmap axes
+    pmap_axis_names: Optional[Sequence[str]] = convert_pmap_axes_names(pmap_axes)
+
+    step_increment: Union[int, Array]
+    if weights is None:
+        step_increment = np.prod(batch_dims)
+    else:
+        step_increment = jnp.sum(weights)
+
+    # Apply psum across all specified axes
+    if pmap_axis_names is not None:
+        step_increment = _psum_over_axes(step_increment, pmap_axis_names)
+
+    count: Union[int, Array] = state.count + step_increment
+
+    # Validation is important. If the shapes don't match exactly, but are
+    # compatible, arrays will be silently broadcasted resulting in incorrect
+    # statistics.
+    if validate_shapes:
+        if weights is not None:
+            if weights.shape != batch_dims:
+                raise ValueError(f"{weights.shape} != {batch_dims}")
+        _validate_batch_shapes(batch, state.mean, batch_dims)
+
+    def _compute_node_statistics(
+        path: Path, mean: Array, summed_variance: Array, batch: Array
+    ) -> Tuple[Array, Array]:
+        assert isinstance(mean, Array), type(mean)
+        assert isinstance(summed_variance, Array), type(summed_variance)
+        if not _is_path_included(config, path):
+            # Return unchanged.
+            return mean, summed_variance
+        # The mean and the sum of past variances are updated with Welford's
+        # algorithm using batches (see https://stackoverflow.com/q/56402955).
+        diff_to_old_mean: Array = batch - mean
+        if weights is not None:
+            expanded_weights: Array = jnp.reshape(
+                weights, list(weights.shape) + [1] * (batch.ndim - weights.ndim)
+            )
+            diff_to_old_mean = diff_to_old_mean * expanded_weights
+        mean_update: Array = jnp.sum(diff_to_old_mean, axis=batch_axis) / count
+        mean_update = _psum_over_axes(mean_update, pmap_axis_names)
+        mean = mean + mean_update
+
+        diff_to_new_mean: Array = batch - mean
+        variance_update: Array = diff_to_old_mean * diff_to_new_mean
+        variance_update = jnp.sum(variance_update, axis=batch_axis)
+        variance_update = _psum_over_axes(variance_update, pmap_axis_names)
+        summed_variance = summed_variance + variance_update
+        return mean, summed_variance
+
+    updated_stats: Union[Tuple[Array, Array], chex.ArrayTree] = fast_map_structure_with_path(
+        _compute_node_statistics, state.mean, state.summed_variance, batch
+    )
+    # map_structure_up_to is slow, so shortcut if we know the input is not
+    # structured.
+    mean: chex.ArrayTree
+    summed_variance: chex.ArrayTree
+    if isinstance(state.mean, Array):
+        mean, summed_variance = updated_stats  # type: ignore
+    else:
+        # Reshape the updated stats from `nest(mean, summed_variance)` to
+        # `nest(mean), nest(summed_variance)`.
+        mean, summed_variance = [
+            tree.map_structure_up_to(state.mean, lambda s, i=idx: s[i], updated_stats)
+            for idx in range(2)
+        ]
+
+    def compute_std(path: Path, summed_variance: Array, std: Array) -> Array:
+        assert isinstance(summed_variance, Array)
+        if not _is_path_included(config, path):
+            return std
+        # Summed variance can get negative due to rounding errors.
+        summed_variance = jnp.maximum(summed_variance, 0)
+        variance = summed_variance / count
+        variance = jnp.clip(variance, jnp.square(std_min_value), jnp.square(std_max_value))
+        std = jnp.sqrt(variance)
+        std = jnp.clip(std, std_min_value, std_max_value)
+        return std
+
+    std: chex.ArrayTree = fast_map_structure_with_path(compute_std, summed_variance, state.std)
+
+    return RunningStatisticsState(
+        count=count, mean=mean, summed_variance=summed_variance, std=std  # type: ignore
+    )
+
+
+def normalize(
+    batch: chex.ArrayTree, mean_std: NestedMeanStd, max_abs_value: Optional[float] = None
+) -> chex.ArrayTree:
+    """Normalizes data using running statistics."""
+
+    def normalize_leaf(data: Array, mean: Array, std: Array) -> Array:
+        # Only normalize inexact types.
+        if not jnp.issubdtype(data.dtype, jnp.inexact):
+            return data
+        data = (data - mean) / std
+        if max_abs_value is not None:
+
+            data = jnp.clip(data, -max_abs_value, +max_abs_value)
+        return data
+
+    return fast_map_structure(normalize_leaf, batch, mean_std.mean, mean_std.std)
+
+
+def denormalize(batch: chex.ArrayTree, mean_std: NestedMeanStd) -> chex.ArrayTree:
+    """Denormalizes values in a nested structure using the given mean/std.
+
+    Only values of inexact types are denormalized.
+    See https://numpy.org/doc/stable/_images/dtype-hierarchy.png for Numpy type
+    hierarchy.
+
+    Args:
+      batch: a nested structure containing batch of data.
+      mean_std: mean and standard deviation used for denormalization.
+
+    Returns:
+      Nested structure with denormalized values.
+    """
+
+    def denormalize_leaf(data: Array, mean: Array, std: Array) -> Array:
+        # Only denormalize inexact types.
+        if not np.issubdtype(data.dtype, np.inexact):
+            return data
+        return data * std + mean
+
+    return fast_map_structure(denormalize_leaf, batch, mean_std.mean, mean_std.std)
+
+
+@dataclasses.dataclass(frozen=True)
+class NestClippingConfig:
+    """Specifies how to clip Nests with the same structure.
+
+    Attributes:
+      path_map: A map that specifies how to clip values in Nests with the same
+        structure. Keys correspond to paths in the nest. Values are maximum
+        absolute values to use for clipping. If there is a collision between paths
+        (one path is a prefix of the other), the behavior is undefined.
+    """
+
+    path_map: Tuple[Tuple[Path, float], ...] = ()
+
+
+def get_clip_config_for_path(config: NestClippingConfig, path: Path) -> NestClippingConfig:
+    """Returns the config for a subtree from the leaf defined by the path."""
+    # Start with an empty config.
+    path_map: list[Tuple[Path, float]] = []
+    for map_path, max_abs_value in config.path_map:
+        if _is_prefix(map_path, path):
+            return NestClippingConfig(path_map=(((), max_abs_value),))
+        if _is_prefix(path, map_path):
+            path_map.append((map_path[len(path) :], max_abs_value))
+    return NestClippingConfig(path_map=tuple(path_map))
+
+
+def clip(batch: chex.ArrayTree, clipping_config: NestClippingConfig) -> chex.ArrayTree:
+    """Clips the batch."""
+
+    def max_abs_value_for_path(path: Path, x: Array) -> Optional[float]:
+        del x  # Unused, needed by interface.
+        return next(
+            (
+                max_abs_value
+                for clipping_path, max_abs_value in clipping_config.path_map
+                if _is_prefix(clipping_path, path)
+            ),
+            None,
+        )
+
+    max_abs_values: chex.ArrayTree = fast_map_structure_with_path(max_abs_value_for_path, batch)
+
+    def clip_leaf(data: Array, max_abs_value: Optional[float]) -> Array:
+        if max_abs_value is not None:
+            data = jnp.clip(data, -max_abs_value, +max_abs_value)
+        return data
+
+    return fast_map_structure(clip_leaf, batch, max_abs_values)
+
+
+# Define type variable for NamedTuple subclasses
+NT = TypeVar("NT", bound=NamedTuple)
+
+
+def add_field_to_state(
+    base_class: Type[NT], extra_field_name: str, extra_field_type: Type[Any]
+) -> Type[NamedTuple]:
+    """Create a new NamedTuple class by extending an existing NamedTuple class with an additional field.
+
+    This function creates a specialized NamedTuple class that behaves in a special way:
+    1. It includes all fields from the base class plus the extra field
+    2. The extra field is accessible as a normal attribute (obj.extra_field_name)
+    3. When unpacking the object (a, b, c = obj), only the original fields are included
+    4. The _replace method works with all fields including the extra field
+    5. copy.deepcopy works correctly
+
+    This approach is useful when you need to attach metadata or state to an existing
+    NamedTuple without affecting its unpacking behavior in existing code.
+
+    Args:
+        base_class: The NamedTuple class to extend (not an instance).
+        extra_field_name: The name of the additional field to add to the new class.
+        extra_field_type: The type of the additional field to add to the new class.
+
+    Returns:
+        A new NamedTuple class with all fields from base_class plus the extra field.
+        When unpacking, only the original fields from base_class will be included.
+    """
+    # Get field names and annotations from the base class
+    fields = getattr(base_class, "_fields", ())
+    annotations = getattr(base_class, "__annotations__", {})
+
+    # Create a new class with all original fields plus the new one
+    new_fields: Dict[str, Type[Any]] = {field: annotations.get(field, Any) for field in fields}
+    new_fields[extra_field_name] = extra_field_type
+
+    # Create the new NamedTuple class with all the fields
+    class_name = f"Enhanced{base_class.__name__}"
+
+    # Create the new class
+    result_class = types.new_class(
+        class_name,
+        (NamedTuple,),
+        {},
+        lambda ns: ns.update(
+            {
+                "__annotations__": new_fields,
+                "__doc__": f"Version of {base_class.__name__} with extra field '{extra_field_name}'.",
+                "__module__": base_class.__module__,
+            }
+        ),
+    )
+
+    # Need to preserve the _fields for proper replacement
+    all_fields = getattr(result_class, "_fields", ())
+
+    # Override __iter__ to only include base fields when unpacking
+    def custom_iter(self: Any) -> Any:
+        """Iterates only through the original fields, not the extra field."""
+        return iter(getattr(self, field) for field in fields)
+
+    result_class.__iter__ = custom_iter  # type: ignore
+
+    # Fix the _replace method to ensure it still works
+    def custom_replace(self: Any, **kwargs: Any) -> Any:
+        """Custom replacement that works with the modified structure.
+
+        Allows replacing any field (original or extra) while preserving the
+        custom unpacking behavior.
+        """
+        # Get a dictionary of all current values
+        current_values: Dict[str, Any] = {}
+        for field in all_fields:
+            current_values[field] = getattr(self, field)
+
+        # Update with new values
+        current_values.update(kwargs)
+
+        # Create new instance with updated values
+        return type(self)(**current_values)
+
+    result_class._replace = custom_replace  # type: ignore
+
+    # Add __getnewargs__ to support copy.deepcopy
+    def custom_getnewargs(self: Any) -> tuple:
+        """Return all field values for pickling/copying, including the extra field."""
+        return tuple(getattr(self, field) for field in all_fields)
+
+    result_class.__getnewargs__ = custom_getnewargs  # type: ignore
+
+    return result_class
+
+
+def create_with_running_statistics(state: NT, running_statistics: RunningStatisticsState) -> Any:
+    """Add running statistics to a state instance.
+
+    This function takes an existing state instance and attaches running statistics
+    to it, creating a new version of the state class. The state
+    has special unpacking behavior - when unpacked, only the original state fields
+    are included, but the running_statistics field can be accessed directly.
+
+    Key behaviors:
+    1. The running_statistics field is accessible as state.running_statistics
+    2. When unpacking (a, b, c = state), only the original fields are included
+    3. All NamedTuple methods like _replace work on all fields
+    4. copy.deepcopy works correctly
+
+    Args:
+        state: An instance of a NamedTuple state.
+        running_statistics: The RunningStatisticsState instance to add to the state.
+
+    Returns:
+        A new instance of an enhanced state class that includes the running statistics
+        field but excludes it from unpacking operations.
+    """
+    cls_type = type(state)
+    new_cls_type = add_field_to_state(cls_type, "running_statistics", type(running_statistics))
+    state_dict = state._asdict()
+    state_dict["running_statistics"] = running_statistics
+    return new_cls_type(**state_dict)  # type: ignore
+</file>
+
+<file path="stoix/configs/network/mlp.yaml">
+# ---MLP PPO Networks---
+actor_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  action_head:
+    _target_: stoix.networks.heads.CategoricalHead
+
+critic_network:
+  pre_torso:
+    _target_: stoix.networks.torso.MLPTorso
+    layer_sizes: [256, 256]
+    use_layer_norm: False
+    activation: relu
+  critic_head:
+    _target_: stoix.networks.heads.ScalarCriticHead
+</file>
+
+<file path="stoix/utils/jax_utils.py">
+import time
+from typing import Any
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+from colorama import Fore, Style
+from jax._src.pjit import JitWrapped
+
+
+def scale_gradient(g: chex.Array, scale: float = 1) -> chex.Array:
+    """Scales the gradient of `g` by `scale` but keeps the original value unchanged."""
+    return g * scale + jax.lax.stop_gradient(g) * (1.0 - scale)
+
+
+def count_parameters(params: chex.ArrayTree) -> int:
+    """Counts the number of parameters in a parameter tree."""
+    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+
+
+def ndim_at_least(x: chex.Array, num_dims: chex.Numeric) -> chex.Array:
+    """Check if the number of dimensions of `x` is at least `num_dims`."""
+    if not (isinstance(x, jax.Array) or isinstance(x, np.ndarray)):
+        x = jnp.asarray(x)
+    return x.ndim >= num_dims
+
+
+def merge_leading_dims(x: chex.Array, num_dims: chex.Numeric) -> chex.Array:
+    """Merge leading dimensions.
+
+    Note:
+        This implementation is a generic function for merging leading dimensions
+        extracted from Haiku.
+        For the original implementation, please refer to the following link:
+        (https://github.com/deepmind/dm-haiku/blob/main/haiku/_src/basic.py#L207)
+    """
+    # Don't merge if there aren't dimensions to merge.
+    if not ndim_at_least(x, num_dims):
+        return x
+
+    new_shape = (np.prod(x.shape[:num_dims]),) + x.shape[num_dims:]
+    return x.reshape(new_shape)
+
+
+@jax.jit
+def unreplicate_n_dims(x: chex.ArrayTree, unreplicate_depth: int = 2) -> chex.ArrayTree:
+    """Unreplicates a pytree by removing the first `unreplicate_depth` axes.
+
+    This function takes a pytree and removes some number of axes, associated with parameter
+    duplication for running multiple updates across devices and in parallel with `vmap`.
+    This is typically one axis for device replication, and one for the `update batch size`.
+    """
+    return jax.tree_util.tree_map(lambda x: x[(0,) * unreplicate_depth], x)  # type: ignore
+
+
+@jax.jit
+def unreplicate_batch_dim(x: chex.ArrayTree) -> chex.ArrayTree:
+    """Unreplicated just the update batch dimension.
+    (The dimension that is vmapped over when acting and learning)
+
+    In stoix's case it is always the second dimension, after the device dimension.
+    We simply take element 0 as the params are identical across this dimension.
+    """
+    return jax.tree_util.tree_map(lambda x: x[:, 0, ...], x)  # type: ignore
+
+
+def aot_compile(
+    fn_to_compile: JitWrapped,
+    fn_name: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """
+    Compiles a JAX function ahead-of-time and prints benchmarking information.
+
+    This function generalizes the process of tracing, lowering, and compiling
+    a JAX function, making it reusable for different functions like learners,
+    evaluators, etc.
+
+    Args:
+        fn_to_compile: The jitted or pmapped JAX function to be compiled.
+        fn_name: A descriptive name for the function (e.g., "Learner", "Evaluator")
+                 used for printing logs.
+        *args: Positional arguments to be passed to the function for tracing.
+        **kwargs: Keyword arguments to be passed to the function for tracing.
+
+    Returns:
+        The compiled function artifact.
+    """
+    print(f"{Fore.YELLOW}Compiling {fn_name} function ahead of time...{Style.RESET_ALL}")
+    start_time = time.time()
+
+    # Use the provided args and kwargs to trace the function
+    traced_fn = fn_to_compile.trace(*args, **kwargs)
+    lowered_fn = traced_fn.lower()
+    compiled_fn = lowered_fn.compile()
+
+    elapsed = time.time() - start_time
+
+    # Extract cost analysis safely
+    cost_analysis = compiled_fn.cost_analysis()
+    flops_estimate = cost_analysis.get("flops", 0)
+
+    print(
+        f"{Fore.GREEN}{Style.BRIGHT}{fn_name} function compiled in "
+        f"{elapsed:.2f} seconds.{Style.RESET_ALL}"
+    )
+    if flops_estimate > 0:
+        print(
+            f"{Fore.GREEN}{Style.BRIGHT}{fn_name} function FLOPs: "
+            f"{flops_estimate / 1e9:.3f} GFlops.{Style.RESET_ALL}"
+        )
+
+    return compiled_fn
+</file>
+
+<file path="stoix/configs/system/ppo/ff_ppo.yaml">
+# --- Defaults FF-PPO ---
+
+system_name: ff_ppo # Name of the system.
+
+# --- RL hyperparameters ---
+actor_lr: 3e-4 # Learning rate for actor network
+critic_lr: 3e-4 # Learning rate for critic network
+rollout_length: 128 # Number of environment steps per vectorised environment
+epochs: 4 # Number of ppo epochs per training data batch.
+num_minibatches: 16 # Number of minibatches per ppo epoch
+gamma: 0.99 # Discounting factor.
+gae_lambda: 0.95 # Lambda value for GAE computation.
+clip_eps: 0.2 # Clipping value for PPO updates and value function
+ent_coef: 0.01 # Entropy regularisation term for loss function
+vf_coef: 0.5 # Critic weight
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: True # Whether learning rates should be linearly decayed during training.
+reward_scale: 1.0 # Scale factor for rewards, useful for environments with large reward magnitudes.
+standardize_advantages: True # Whether to standardize the advantages.
+kl_penalty_coef: 3.0 # KL penalty coefficient for PPO updates if using PPO Penalty.
+normalize_observations: False # Whether to normalize observations using running statistics if observation normalisation is implemented.
+obs_norm_warmup_steps: 128 # If normalising observations, number of warmup steps to collect observations for initial statistics = total_num_envs * obs_norm_warmup_steps.
+</file>
+
+<file path="stoix/networks/heads.py">
+from typing import Optional, Sequence, Tuple, Union
+
+import chex
+import distrax
+import jax
+import jax.numpy as jnp
+import numpy as np
+import tensorflow_probability.substrates.jax as tfp
+from flax import linen as nn
+from flax.linen.initializers import Initializer, lecun_normal, orthogonal
+from tensorflow_probability.substrates.jax.distributions import (
+    Categorical,
+    Deterministic,
+    Independent,
+    MultivariateNormalDiag,
+    Normal,
+    TransformedDistribution,
+)
+
+from stoix.networks.distributions import (
+    AffineTanhTransformedDistribution,
+    ClippedBeta,
+    DiscreteValuedTfpDistribution,
+    MultiDiscreteActionDistribution,
+)
+
+tfb = tfp.bijectors
+
+
+class CategoricalHead(nn.Module):
+    action_dim: Union[int, Sequence[int]]
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> Categorical:
+        logits = nn.Dense(np.prod(self.action_dim), kernel_init=self.kernel_init)(embedding)
+
+        if not isinstance(self.action_dim, int):
+            logits = logits.reshape(self.action_dim)
+
+        return Categorical(logits=logits)
+
+
+class NormalAffineTanhDistributionHead(nn.Module):
+
+    action_dim: int
+    minimum: float
+    maximum: float
+    min_scale: float = 1e-3
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> Independent:
+
+        loc = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+        scale = (
+            jax.nn.softplus(nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding))
+            + self.min_scale
+        )
+        distribution = Normal(loc=loc, scale=scale)
+
+        return Independent(
+            AffineTanhTransformedDistribution(distribution, self.minimum, self.maximum),
+            reinterpreted_batch_ndims=1,
+        )
+
+
+class BetaDistributionHead(nn.Module):
+
+    action_dim: int
+    minimum: float
+    maximum: float
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> Independent:
+
+        # Use alpha and beta >= 1 according to [Chou et. al, 2017]
+        alpha = (
+            jax.nn.softplus(nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)) + 1
+        )
+        beta = (
+            jax.nn.softplus(nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)) + 1
+        )
+        # Calculate scale and shift for the affine transformation to achieve the range
+        # [minimum, maximum].
+        scale = self.maximum - self.minimum
+        shift = self.minimum
+        affine_bijector = tfb.Chain([tfb.Shift(shift), tfb.Scale(scale)])
+
+        transformed_distribution = TransformedDistribution(
+            ClippedBeta(alpha, beta), bijector=affine_bijector
+        )
+
+        return Independent(
+            transformed_distribution,
+            reinterpreted_batch_ndims=1,
+        )
+
+
+class MultivariateNormalDiagHead(nn.Module):
+
+    action_dim: int
+    init_scale: float = 0.3
+    min_scale: float = 1e-3
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> distrax.DistributionLike:
+        loc = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+        scale = jax.nn.softplus(nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding))
+        scale *= self.init_scale / jax.nn.softplus(0.0)
+        scale += self.min_scale
+        return MultivariateNormalDiag(loc=loc, scale_diag=scale)
+
+
+class DeterministicHead(nn.Module):
+    action_dim: int
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+
+        x = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+
+        return Deterministic(x)
+
+
+class ScalarCriticHead(nn.Module):
+    kernel_init: Initializer = orthogonal(1.0)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+        return nn.Dense(1, kernel_init=self.kernel_init)(embedding).squeeze(axis=-1)
+
+
+class CategoricalCriticHead(nn.Module):
+
+    num_atoms: int = 601
+    vmax: Optional[float] = None
+    vmin: Optional[float] = None
+    kernel_init: Initializer = orthogonal(1.0)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> distrax.DistributionLike:
+        vmax = self.vmax if self.vmax is not None else 0.5 * (self.num_atoms - 1)
+        vmin = self.vmin if self.vmin is not None else -1.0 * vmax
+
+        output = DiscreteValuedTfpHead(
+            vmin=vmin,
+            vmax=vmax,
+            logits_shape=(),
+            num_atoms=self.num_atoms,
+            kernel_init=self.kernel_init,
+        )(embedding)
+
+        return output
+
+
+class DiscreteValuedTfpHead(nn.Module):
+    """Represents a parameterized discrete valued distribution.
+
+    The returned distribution is essentially a `tfd.Categorical` that knows its
+    support and thus can compute the mean value.
+    If vmin and vmax have shape S, this will store the category values as a
+    Tensor of shape (S*, num_atoms).
+
+    Args:
+        vmin: Minimum of the value range
+        vmax: Maximum of the value range
+        num_atoms: The atom values associated with each bin.
+        logits_shape: The shape of the logits, excluding batch and num_atoms
+        dimensions.
+        kernel_init: The initializer for the dense layer.
+    """
+
+    vmin: float
+    vmax: float
+    num_atoms: int
+    logits_shape: Optional[Sequence[int]] = None
+    kernel_init: Initializer = lecun_normal()
+
+    def setup(self) -> None:
+        self._values = np.linspace(self.vmin, self.vmax, num=self.num_atoms, axis=-1)
+        if not self.logits_shape:
+            logits_shape: Sequence[int] = ()
+        else:
+            logits_shape = self.logits_shape
+        self._logits_shape = (
+            *logits_shape,
+            self.num_atoms,
+        )
+        self._logits_size = np.prod(self._logits_shape)
+        self._net = nn.Dense(self._logits_size, kernel_init=self.kernel_init)
+
+    def __call__(self, inputs: chex.Array) -> distrax.DistributionLike:
+        logits = self._net(inputs)
+        logits = logits.reshape(logits.shape[:-1] + self._logits_shape)
+        return DiscreteValuedTfpDistribution(values=self._values, logits=logits)
+
+
+class DiscreteQNetworkHead(nn.Module):
+    action_dim: int
+    epsilon: float = 0.1
+    kernel_init: Initializer = orthogonal(1.0)
+
+    @nn.compact
+    def __call__(
+        self, embedding: chex.Array, epsilon: Optional[float] = None
+    ) -> distrax.EpsilonGreedy:
+
+        q_values = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+
+        if epsilon is None:
+            epsilon = self.epsilon
+
+        return distrax.EpsilonGreedy(preferences=q_values, epsilon=epsilon)
+
+
+class PolicyValueHead(nn.Module):
+    action_head: nn.Module
+    critic_head: nn.Module
+
+    @nn.compact
+    def __call__(
+        self, embedding: chex.Array
+    ) -> Tuple[distrax.DistributionLike, Union[chex.Array, distrax.DistributionLike]]:
+
+        action_distribution = self.action_head(embedding)
+        value = self.critic_head(embedding)
+
+        return action_distribution, value
+
+
+class DistributionalDiscreteQNetwork(nn.Module):
+    action_dim: int
+    epsilon: float
+    num_atoms: int
+    vmin: float
+    vmax: float
+    kernel_init: Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(
+        self, embedding: chex.Array
+    ) -> Tuple[distrax.EpsilonGreedy, chex.Array, chex.Array]:
+        atoms = jnp.linspace(self.vmin, self.vmax, self.num_atoms)
+        q_logits = nn.Dense(self.action_dim * self.num_atoms, kernel_init=self.kernel_init)(
+            embedding
+        )
+        q_logits = jnp.reshape(q_logits, (-1, self.action_dim, self.num_atoms))
+        q_dist = jax.nn.softmax(q_logits)
+        q_values = jnp.sum(q_dist * atoms, axis=2)
+        q_values = jax.lax.stop_gradient(q_values)
+        atoms = jnp.broadcast_to(atoms, (q_values.shape[0], self.num_atoms))
+        return distrax.EpsilonGreedy(preferences=q_values, epsilon=self.epsilon), q_logits, atoms
+
+
+class DistributionalContinuousQNetwork(nn.Module):
+    num_atoms: int
+    vmin: float
+    vmax: float
+    kernel_init: Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(
+        self, embedding: chex.Array
+    ) -> Tuple[distrax.EpsilonGreedy, chex.Array, chex.Array]:
+        atoms = jnp.linspace(self.vmin, self.vmax, self.num_atoms)
+        q_logits = nn.Dense(self.num_atoms, kernel_init=self.kernel_init)(embedding)
+        q_dist = jax.nn.softmax(q_logits)
+        q_value = jnp.sum(q_dist * atoms, axis=-1)
+        atoms = jnp.broadcast_to(atoms, (*q_value.shape, self.num_atoms))
+        return q_value, q_logits, atoms
+
+
+class QuantileDiscreteQNetwork(nn.Module):
+    action_dim: int
+    epsilon: float
+    num_quantiles: int
+    kernel_init: Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> Tuple[distrax.EpsilonGreedy, chex.Array]:
+        q_logits = nn.Dense(self.action_dim * self.num_quantiles, kernel_init=self.kernel_init)(
+            embedding
+        )
+        q_dist = jnp.reshape(q_logits, (-1, self.action_dim, self.num_quantiles))
+        q_values = jnp.mean(q_dist, axis=-1)
+        q_values = jax.lax.stop_gradient(q_values)
+        return distrax.EpsilonGreedy(preferences=q_values, epsilon=self.epsilon), q_dist
+
+
+class LinearHead(nn.Module):
+    output_dim: int
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+
+        return nn.Dense(self.output_dim, kernel_init=self.kernel_init)(embedding)
+
+
+class MultiDiscreteHead(nn.Module):
+    """A head for multi-discrete action spaces, where each
+        discrete subspace can have a different number of dimensions.
+
+    Arguments:
+        action_dim: Total number of actions across all discrete subspaces.
+        number_of_dims_per_distribution: A list where each element
+            represents the number of dimensions for each discrete subspace.
+        kernel_init: Initializer for the dense layer.
+    """
+
+    action_dim: int
+    number_of_dims_per_distribution: list[int]
+    kernel_init: Initializer = orthogonal(0.01)
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> MultiDiscreteActionDistribution:
+        assert sum(self.number_of_dims_per_distribution) == self.action_dim, (
+            f"Sum of number_of_dims_per_distribution {sum(self.number_of_dims_per_distribution)} "
+            f"must equal action_dim {self.action_dim}."
+        )
+        logits = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(embedding)
+
+        return MultiDiscreteActionDistribution(
+            flat_logits=logits, number_of_dims_per_distribution=self.number_of_dims_per_distribution
+        )
+</file>
+
+<file path="stoix/utils/multistep.py">
+from typing import Optional, Tuple, Union
+
+import chex
+import jax
+import jax.numpy as jnp
+from chex import Scalar
+from jax import Array
+
+# These functions are generally taken from rlax but edited to explicitly take in a batch of data.
+# This is because the original rlax functions are not batched and are meant to be used with vmap,
+# which can be much slower.
+
+
+def batch_truncated_generalized_advantage_estimation(
+    r_t: Array,
+    discount_t: Array,
+    lambda_: Union[Array, Scalar],
+    values: Optional[Array] = None,
+    v_tm1: Optional[Array] = None,
+    v_t: Optional[Array] = None,
+    truncation_t: Optional[Array] = None,
+    stop_target_gradients: bool = False,
+    time_major: bool = False,
+    standardize_advantages: bool = False,
+) -> Array:
+    """Computes truncated generalized advantage estimates for batched sequences of length k.
+
+    The advantages are computed in a backwards fashion according to the equation:
+    Âₜ = δₜ + (γλ) * δₜ₊₁ + ... + ... + (γλ)ᵏ⁻ᵗ⁺¹ * δₖ₋₁
+    where δₜ = rₜ₊₁ + γₜ₊₁ * v(sₜ₊₁) - v(sₜ).
+
+    See Proximal Policy Optimization Algorithms, Schulman et al.:
+    https://arxiv.org/abs/1707.06347
+
+    Note: This paper uses a different notation than the RLax standard
+    convention that follows Sutton & Barto. We use rₜ₊₁ to denote the reward
+    received after acting in state sₜ, while the PPO paper uses rₜ.
+
+    Args:
+        r_t: Rewards tensor at times [1, k] with shape [B, T] for batch-major or [T, B]
+            for time-major, where B is batch size and T is the number of time steps.
+        discount_t: Discount tensor at times [1, k] with the same shape as r_t.
+        lambda_: Mixing parameter; a scalar or tensor at times [1, k] with the same
+            shape as r_t.
+        values: Values tensor at times [0, k] with shape [B, T+1] for batch-major or
+        [T+1, B] for time-major. Contains one more element than r_t along the time
+        dimension. If None, the v_tm1 and v_t arguments must be provided. This is if
+        truncation is not used, since in truncation special bootstrap values must be
+        provided. This interface is just for convenience.
+        v_tm1: Values tensor at times [0, k-1] with shape [B, T] for batch-major or
+            [T, B] for time-major. These are the baseline values for the current states.
+            Important: These are the values to be subtracted from the r_t + v_t targets.
+            Due to autoreset, these values must skip the last time step T, autoreset
+            makes the timestep go as [0, 1, 2, ..., T-1, 0, 1, 2, ..., T-1, 0, 1, ...].
+        v_t: Values tensor at times [1, k] with the same shape as r_t.
+            These are the values for bootstrapping from next states i.e. the v_t in
+            r_t + v_t - v_tm1. To correctly handle truncation, these values need to include
+            the values of the final timestep T. These values do not include the first timestep 0.
+            Due to autoreset, these values must skip the first time step 0, so sequences look
+            like [1, 2, ..., T-1, T, 1, 2, ..., T-1, T, 1, ...].
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+            to targets.
+        time_major: bool indicating whether the input tensors are in time-major format
+            (time dimension first) or batch-major format (batch dimension first).
+        standardize_advantages: bool indicating whether to standardize the advantages.
+        truncation_t: Truncation indicators tensor at times [1, k] with the same shape
+            as r_t, where 1 indicates a truncation point and 0 indicates a normal step.
+            If None, no truncation is assumed.
+
+    Returns:
+      A tuple containing:
+        - advantages: The generalized advantage estimates at times [0, k-1].
+        - target_values: The target values for value function training, computed
+          as values + advantages (i.e., values plus advantage estimates).
+    """
+    # if truncation flags are provided, we need to ensure that v_tm1 and v_t are provided
+    if truncation_t is not None:
+        chex.assert_type([v_tm1, v_t], float)
+
+    # If no values are provided, we assume that v_tm1 and v_t are provided.
+    # If values are provided, we use them to create v_tm1 and v_t.
+    if values is None:
+        chex.assert_type([v_tm1, v_t], float)
+    else:
+        chex.assert_rank([values], 2)
+        chex.assert_type([values], float)
+        if time_major:
+            v_tm1 = values[:-1]
+            v_t = values[1:]
+        else:
+            v_tm1 = values[:, :-1]
+            v_t = values[:, 1:]
+
+    chex.assert_rank([r_t, discount_t, v_tm1, v_t], 2)
+    chex.assert_type([r_t, discount_t, v_tm1, v_t], float)
+    chex.assert_equal_shape([r_t, v_tm1, v_t])
+    lambda_ = jnp.ones_like(discount_t) * lambda_  # If scalar, make into vector.
+
+    # Default truncation_t to all zeros if not provided
+    if truncation_t is None:
+        truncation_t = jnp.zeros_like(discount_t)
+    else:
+        chex.assert_rank([truncation_t], 2)
+        chex.assert_equal_shape([truncation_t, discount_t])
+        truncation_t = truncation_t.astype(float)
+
+    if not time_major:
+        r_t = jnp.transpose(r_t, (1, 0))
+        discount_t = jnp.transpose(discount_t, (1, 0))
+        v_tm1 = jnp.transpose(v_tm1, (1, 0))
+        v_t = jnp.transpose(v_t, (1, 0))
+        lambda_ = jnp.transpose(lambda_, (1, 0))
+        truncation_t = jnp.transpose(truncation_t, (1, 0))
+
+    # Use bootstrap_values directly for handling autoreset correctly
+    delta_t = r_t + discount_t * v_t - v_tm1
+
+    # Iterate backwards to calculate advantages.
+    def _body(acc: Array, xs: Tuple[Array, Array, Array, Array]) -> Tuple[Array, Array]:
+        deltas, discounts, lambda_, truncation = xs
+        # Reset accumulator at truncation points while still using the current delta
+        acc = deltas + discounts * lambda_ * acc * (1.0 - truncation)
+        return acc, acc
+
+    _, advantage_t = jax.lax.scan(
+        _body,
+        jnp.zeros(r_t.shape[1]),
+        (delta_t, discount_t, lambda_, truncation_t),
+        reverse=True,
+    )
+
+    target_values = v_tm1 + advantage_t
+
+    if not time_major:
+        advantage_t = jnp.transpose(advantage_t, (1, 0))
+        target_values = jnp.transpose(target_values, (1, 0))
+
+    if standardize_advantages:
+        advantage_t = jax.nn.standardize(advantage_t, axis=(0, 1))
+
+    if stop_target_gradients:
+        advantage_t = jax.lax.stop_gradient(advantage_t)
+        target_values = jax.lax.stop_gradient(target_values)
+
+    return advantage_t, target_values
+
+
+def batch_n_step_bootstrapped_returns(
+    r_t: Array,
+    discount_t: Array,
+    v_t: Array,
+    n: int,
+    lambda_t: float = 1.0,
+    stop_target_gradients: bool = True,
+) -> Array:
+    """Computes strided n-step bootstrapped return targets over a batch of sequences.
+
+    The returns are computed according to the below equation iterated `n` times:
+
+        Gₜ = rₜ₊₁ + γₜ₊₁ [(1 - λₜ₊₁) vₜ₊₁ + λₜ₊₁ Gₜ₊₁].
+
+    When lambda_t == 1. (default), this reduces to
+
+        Gₜ = rₜ₊₁ + γₜ₊₁ * (rₜ₊₂ + γₜ₊₂ * (... * (rₜ₊ₙ + γₜ₊ₙ * vₜ₊ₙ ))).
+
+    Args:
+        r_t: rewards at times B x [1, ..., T].
+        discount_t: discounts at times B x [1, ..., T].
+        v_t: state or state-action values to bootstrap from at time B x [1, ...., T].
+        n: number of steps over which to accumulate reward before bootstrapping.
+        lambda_t: lambdas at times B x [1, ..., T]. Shape is [], or B x [T-1].
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+        estimated bootstrapped returns at times B x [0, ...., T-1]
+    """
+    # swap axes to make time axis the first dimension
+    r_t, discount_t, v_t = jax.tree_util.tree_map(
+        lambda x: jnp.swapaxes(x, 0, 1), (r_t, discount_t, v_t)
+    )
+    seq_len = r_t.shape[0]
+    batch_size = r_t.shape[1]
+
+    # Maybe change scalar lambda to an array.
+    lambda_t = jnp.ones_like(discount_t) * lambda_t
+
+    # Shift bootstrap values by n and pad end of sequence with last value v_t[-1].
+    pad_size = min(n - 1, seq_len)
+    targets = jnp.concatenate([v_t[n - 1 :], jnp.array([v_t[-1]] * pad_size)], axis=0)
+
+    # Pad sequences. Shape is now (T + n - 1,).
+    r_t = jnp.concatenate([r_t, jnp.zeros((n - 1, batch_size))], axis=0)
+    discount_t = jnp.concatenate([discount_t, jnp.ones((n - 1, batch_size))], axis=0)
+    lambda_t = jnp.concatenate([lambda_t, jnp.ones((n - 1, batch_size))], axis=0)
+    v_t = jnp.concatenate([v_t, jnp.array([v_t[-1]] * (n - 1))], axis=0)
+
+    # Work backwards to compute n-step returns.
+    for i in reversed(range(n)):
+        r_ = r_t[i : i + seq_len]
+        discount_ = discount_t[i : i + seq_len]
+        lambda_ = lambda_t[i : i + seq_len]
+        v_ = v_t[i : i + seq_len]
+        targets = r_ + discount_ * ((1.0 - lambda_) * v_ + lambda_ * targets)
+
+    targets = jnp.swapaxes(targets, 0, 1)
+    return jax.lax.select(stop_target_gradients, jax.lax.stop_gradient(targets), targets)
+
+
+def batch_general_off_policy_returns_from_q_and_v(
+    q_t: Array,
+    v_t: Array,
+    r_t: Array,
+    discount_t: Array,
+    c_t: Array,
+    stop_target_gradients: bool = False,
+) -> Array:
+    """Calculates targets for various off-policy evaluation algorithms.
+
+    Given a window of experience of length `K+1`, generated by a behaviour policy
+    μ, for each time-step `t` we can estimate the return `G_t` from that step
+    onwards, under some target policy π, using the rewards in the trajectory, the
+    values under π of states and actions selected by μ, according to equation:
+
+      Gₜ = rₜ₊₁ + γₜ₊₁ * (vₜ₊₁ - cₜ₊₁ * q(aₜ₊₁) + cₜ₊₁* Gₜ₊₁),
+
+    where, depending on the choice of `c_t`, the algorithm implements:
+
+      Importance Sampling             c_t = π(x_t, a_t) / μ(x_t, a_t),
+      Harutyunyan's et al. Q(lambda)  c_t = λ,
+      Precup's et al. Tree-Backup     c_t = π(x_t, a_t),
+      Munos' et al. Retrace           c_t = λ min(1, π(x_t, a_t) / μ(x_t, a_t)).
+
+    See "Safe and Efficient Off-Policy Reinforcement Learning" by Munos et al.
+    (https://arxiv.org/abs/1606.02647).
+
+    Args:
+      q_t: Q-values under π of actions executed by μ at times [1, ..., K - 1].
+      v_t: Values under π at times [1, ..., K].
+      r_t: rewards at times [1, ..., K].
+      discount_t: discounts at times [1, ..., K].
+      c_t: weights at times [1, ..., K - 1].
+      stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+      Off-policy estimates of the generalized returns from states visited at times
+      [0, ..., K - 1].
+    """
+    q_t, v_t, r_t, discount_t, c_t = jax.tree_util.tree_map(
+        lambda x: jnp.swapaxes(x, 0, 1), (q_t, v_t, r_t, discount_t, c_t)
+    )
+
+    g = r_t[-1] + discount_t[-1] * v_t[-1]  # G_K-1.
+
+    def _body(acc: Array, xs: Tuple[Array, Array, Array, Array, Array]) -> Tuple[Array, Array]:
+        reward, discount, c, v, q = xs
+        acc = reward + discount * (v - c * q + c * acc)
+        return acc, acc
+
+    _, returns = jax.lax.scan(
+        _body, g, (r_t[:-1], discount_t[:-1], c_t, v_t[:-1], q_t), reverse=True
+    )
+    returns = jnp.concatenate([returns, g[jnp.newaxis]], axis=0)
+
+    returns = jnp.swapaxes(returns, 0, 1)
+    return jax.lax.select(stop_target_gradients, jax.lax.stop_gradient(returns), returns)
+
+
+def batch_retrace_continuous(
+    q_tm1: Array,
+    q_t: Array,
+    v_t: Array,
+    r_t: Array,
+    discount_t: Array,
+    log_rhos: Array,
+    lambda_: Union[Array, float],
+    stop_target_gradients: bool = True,
+) -> Array:
+    """Retrace continuous.
+
+    See "Safe and Efficient Off-Policy Reinforcement Learning" by Munos et al.
+    (https://arxiv.org/abs/1606.02647).
+
+    Args:
+      q_tm1: Q-values at times [0, ..., K - 1].
+      q_t: Q-values evaluated at actions collected using behavior
+        policy at times [1, ..., K - 1].
+      v_t: Value estimates of the target policy at times [1, ..., K].
+      r_t: reward at times [1, ..., K].
+      discount_t: discount at times [1, ..., K].
+      log_rhos: Log importance weight pi_target/pi_behavior evaluated at actions
+        collected using behavior policy [1, ..., K - 1].
+      lambda_: scalar or a vector of mixing parameter lambda.
+      stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+      Retrace error.
+    """
+
+    c_t = jnp.minimum(1.0, jnp.exp(log_rhos)) * lambda_
+
+    # The generalized returns are independent of Q-values and cs at the final
+    # state.
+    target_tm1 = batch_general_off_policy_returns_from_q_and_v(q_t, v_t, r_t, discount_t, c_t)
+
+    target_tm1 = jax.lax.select(
+        stop_target_gradients, jax.lax.stop_gradient(target_tm1), target_tm1
+    )
+    return target_tm1 - q_tm1
+
+
+def batch_lambda_returns(
+    r_t: Array,
+    discount_t: Array,
+    v_t: Array,
+    lambda_: chex.Numeric = 1.0,
+    stop_target_gradients: bool = False,
+    time_major: bool = False,
+) -> Array:
+    """Estimates a multistep truncated lambda return from a trajectory.
+
+    Given a a trajectory of length `T+1`, generated under some policy π, for each
+    time-step `t` we can estimate a target return `G_t`, by combining rewards,
+    discounts, and state values, according to a mixing parameter `lambda`.
+
+    The parameter `lambda_`  mixes the different multi-step bootstrapped returns,
+    corresponding to accumulating `k` rewards and then bootstrapping using `v_t`.
+
+        rₜ₊₁ + γₜ₊₁ vₜ₊₁
+        rₜ₊₁ + γₜ₊₁ rₜ₊₂ + γₜ₊₁ γₜ₊₂ vₜ₊₂
+        rₜ₊₁ + γₜ₊₁ rₜ₊₂ + γₜ₊₁ γₜ₊₂ rₜ₊₂ + γₜ₊₁ γₜ₊₂ γₜ₊₃ vₜ₊₃
+
+    The returns are computed recursively, from `G_{T-1}` to `G_0`, according to:
+
+        Gₜ = rₜ₊₁ + γₜ₊₁ [(1 - λₜ₊₁) vₜ₊₁ + λₜ₊₁ Gₜ₊₁].
+
+    In the `on-policy` case, we estimate a return target `G_t` for the same
+    policy π that was used to generate the trajectory. In this setting the
+    parameter `lambda_` is typically a fixed scalar factor. Depending
+    on how values `v_t` are computed, this function can be used to construct
+    targets for different multistep reinforcement learning updates:
+
+        TD(λ):  `v_t` contains the state value estimates for each state under π.
+        Q(λ):  `v_t = max(q_t, axis=-1)`, where `q_t` estimates the action values.
+        Sarsa(λ):  `v_t = q_t[..., a_t]`, where `q_t` estimates the action values.
+
+    In the `off-policy` case, the mixing factor is a function of state, and
+    different definitions of `lambda` implement different off-policy corrections:
+
+        Per-decision importance sampling:  λₜ = λ ρₜ = λ [π(aₜ|sₜ) / μ(aₜ|sₜ)]
+        V-trace, as instantiated in IMPALA:  λₜ = min(1, ρₜ)
+
+    Note that the second option is equivalent to applying per-decision importance
+    sampling, but using an adaptive λ(ρₜ) = min(1/ρₜ, 1), such that the effective
+    bootstrap parameter at time t becomes λₜ = λ(ρₜ) * ρₜ = min(1, ρₜ).
+    This is the interpretation used in the ABQ(ζ) algorithm (Mahmood 2017).
+
+    Of course this can be augmented to include an additional factor λ.  For
+    instance we could use V-trace with a fixed additional parameter λ = 0.9, by
+    setting λₜ = 0.9 * min(1, ρₜ) or, alternatively (but not equivalently),
+    λₜ = min(0.9, ρₜ).
+
+    Estimated return are then often used to define a td error, e.g.:  ρₜ(Gₜ - vₜ).
+
+    See "Reinforcement Learning: An Introduction" by Sutton and Barto.
+    (http://incompleteideas.net/sutton/book/ebook/node74.html).
+
+    Args:
+        r_t: sequence of rewards rₜ for timesteps t in B x [1, T].
+        discount_t: sequence of discounts γₜ for timesteps t in B x [1, T].
+        v_t: sequence of state values estimates under π for timesteps t in B x [1, T].
+        lambda_: mixing parameter; a scalar or a vector for timesteps t in B x [1, T].
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+        time_major: If True, the first dimension of the input tensors is the time
+        dimension.
+
+    Returns:
+        Multistep lambda returns.
+    """
+
+    chex.assert_rank([r_t, discount_t, v_t, lambda_], [2, 2, 2, {0, 1, 2}])
+    chex.assert_type([r_t, discount_t, v_t, lambda_], float)
+    chex.assert_equal_shape([r_t, discount_t, v_t])
+
+    # Swap axes to make time axis the first dimension
+    if not time_major:
+        r_t, discount_t, v_t = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1), (r_t, discount_t, v_t)
+        )
+
+    # If scalar make into vector.
+    lambda_ = jnp.ones_like(discount_t) * lambda_
+
+    # Work backwards to compute `G_{T-1}`, ..., `G_0`.
+    def _body(acc: Array, xs: Tuple[Array, Array, Array, Array]) -> Tuple[Array, Array]:
+        returns, discounts, values, lambda_ = xs
+        acc = returns + discounts * ((1 - lambda_) * values + lambda_ * acc)
+        return acc, acc
+
+    _, returns = jax.lax.scan(_body, v_t[-1], (r_t, discount_t, v_t, lambda_), reverse=True)
+
+    if not time_major:
+        returns = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), returns)
+
+    return jax.lax.select(stop_target_gradients, jax.lax.stop_gradient(returns), returns)
+
+
+def batch_discounted_returns(
+    r_t: Array,
+    discount_t: Array,
+    v_t: Array,
+    stop_target_gradients: bool = False,
+    time_major: bool = False,
+) -> Array:
+    """Calculates a discounted return from a trajectory.
+
+    The returns are computed recursively, from `G_{T-1}` to `G_0`, according to:
+
+        Gₜ = rₜ₊₁ + γₜ₊₁ Gₜ₊₁.
+
+    See "Reinforcement Learning: An Introduction" by Sutton and Barto.
+    (http://incompleteideas.net/sutton/book/ebook/node61.html).
+
+    Args:
+        r_t: reward sequence at time t.
+        discount_t: discount sequence at time t.
+        v_t: value sequence or scalar at time t.
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+        Discounted returns.
+    """
+    chex.assert_rank([r_t, discount_t, v_t], [2, 2, {0, 1, 2}])
+    chex.assert_type([r_t, discount_t, v_t], float)
+
+    # If scalar make into vector.
+    bootstrapped_v = jnp.ones_like(discount_t) * v_t
+    return batch_lambda_returns(
+        r_t,
+        discount_t,
+        bootstrapped_v,
+        lambda_=1.0,
+        stop_target_gradients=stop_target_gradients,
+        time_major=time_major,
+    )
+
+
+def importance_corrected_td_errors(
+    r_t: Array,
+    discount_t: Array,
+    rho_tm1: Array,
+    lambda_: Array,
+    values: Array,
+    truncation_t: Array = None,
+    stop_target_gradients: bool = False,
+) -> Array:
+    """Computes the multistep td errors with per decision importance sampling.
+
+    Given a trajectory of length `T+1`, generated under some policy π, for each
+    time-step `t` we can estimate a multistep temporal difference error δₜ(ρ,λ),
+    by combining rewards, discounts, and state values, according to a mixing
+    parameter `λ` and importance sampling ratios ρₜ = π(aₜ|sₜ) / μ(aₜ|sₜ):
+
+      td-errorₜ = ρₜ δₜ(ρ,λ)
+      δₜ(ρ,λ) = δₜ + ρₜ₊₁ λₜ₊₁ γₜ₊₁ δₜ₊₁(ρ,λ),
+
+    where δₜ = rₜ₊₁ + γₜ₊₁ vₜ₊₁ - vₜ is the one step, temporal difference error
+    for the agent's state value estimates. This is equivalent to computing
+    the λ-return with λₜ = ρₜ (e.g. using the `lambda_returns` function from
+    above), and then computing errors as  td-errorₜ = ρₜ(Gₜ - vₜ).
+
+    See "A new Q(λ) with interim forward view and Monte Carlo equivalence"
+    by Sutton et al. (http://proceedings.mlr.press/v32/sutton14.html).
+
+    Args:
+      r_t: sequence of rewards rₜ for timesteps t in [1, T].
+      discount_t: sequence of discounts γₜ for timesteps t in [1, T].
+      rho_tm1: sequence of importance ratios for all timesteps t in [0, T-1].
+      lambda_: mixing parameter; scalar or have per timestep values in [1, T].
+      values: sequence of state values under π for all timesteps t in [0, T].
+      truncation_t: sequence of truncation indicators at times [1, T], where 1 indicates
+        a truncation point and 0 indicates a normal step. If None, no truncation is assumed.
+      stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+
+    Returns:
+      Off-policy estimates of the multistep td errors.
+    """
+    chex.assert_rank([r_t, discount_t, rho_tm1, values], [1, 1, 1, 1])
+    chex.assert_type([r_t, discount_t, rho_tm1, values], float)
+    chex.assert_equal_shape([r_t, discount_t, rho_tm1, values[1:]])
+
+    v_tm1 = values[:-1]  # Predictions to compute errors for.
+    v_t = values[1:]  # Values for bootstrapping.
+    rho_t = jnp.concatenate((rho_tm1[1:], jnp.array([1.0])))  # Unused dummy value.
+    lambda_ = jnp.ones_like(discount_t) * lambda_  # If scalar, make into vector.
+
+    # Default truncation_t to all zeros if not provided
+    if truncation_t is None:
+        truncation_t = jnp.zeros_like(discount_t)
+    else:
+        chex.assert_rank([truncation_t], 1)
+        chex.assert_type([truncation_t], float)
+        chex.assert_equal_shape([truncation_t, discount_t])
+
+    # Compute the one step temporal difference errors.
+    one_step_delta = r_t + discount_t * v_t - v_tm1
+
+    # Work backwards to compute `delta_{T-1}`, ..., `delta_0`.
+    def _body(acc: Array, xs: Tuple[Array, Array, Array, Array, Array]) -> Tuple[Array, Array]:
+        deltas, discounts, rho_t, lambda_, truncation = xs
+        # Reset accumulator at truncation points while still using the current delta
+        acc = deltas + discounts * rho_t * lambda_ * acc * (1.0 - truncation)
+        return acc, acc
+
+    _, errors = jax.lax.scan(
+        _body,
+        0.0,
+        (one_step_delta, discount_t, rho_t, lambda_, truncation_t),
+        reverse=True,
+    )
+
+    errors = rho_tm1 * errors
+    return jax.lax.select(
+        stop_target_gradients, jax.lax.stop_gradient(errors + v_tm1) - v_tm1, errors
+    )
+
+
+def batch_q_lambda(
+    r_t: chex.Array,
+    discount_t: chex.Array,
+    q_t: chex.Array,
+    lambda_: chex.Numeric,
+    stop_target_gradients: bool = True,
+    time_major: bool = False,
+) -> chex.Array:
+    """Calculates Peng's or Watkins' Q(lambda) returns.
+
+    See "Reinforcement Learning: An Introduction" by Sutton and Barto.
+    (http://incompleteideas.net/book/ebook/node78.html).
+
+    Args:
+        r_t: sequence of rewards at time t.
+        discount_t: sequence of discounts at time t.
+        q_t: sequence of Q-values at time t.
+        lambda_: mixing parameter lambda, either a scalar (e.g. Peng's Q(lambda)) or
+        a sequence (e.g. Watkin's Q(lambda)).
+        stop_target_gradients: bool indicating whether or not to apply stop gradient
+        to targets.
+        time_major: If True, the first dimension of the input tensors is the time.
+
+    Returns:
+        Q(lambda) target values.
+    """
+    chex.assert_rank([r_t, discount_t, q_t, lambda_], [2, 2, 3, {0, 1, 2}])
+    chex.assert_type([r_t, discount_t, q_t, lambda_], [float, float, float, float])
+    v_t = jnp.max(q_t, axis=-1)
+    target_tm1 = batch_lambda_returns(
+        r_t, discount_t, v_t, lambda_, stop_target_gradients, time_major=time_major
+    )
+
+    target_tm1 = jax.lax.select(
+        stop_target_gradients, jax.lax.stop_gradient(target_tm1), target_tm1
+    )
+    return target_tm1
+</file>
+
+<file path="stoix/configs/arch/anakin.yaml">
+# --- Anakin config ---
+architecture_name: anakin
+# --- Training ---
+seed: 42  # RNG seed.
+update_batch_size: 1 # Number of vectorised gradient updates per device.
+total_num_envs: 1024  # Total Number of vectorised environments across all devices and batched_updates. Needs to be divisible by n_devices*update_batch_size.
+total_timesteps: 1e7 # Set the total environment steps.
+# If unspecified, it's derived from num_updates; otherwise, num_updates adjusts based on this value.
+num_updates: ~ # Number of updates
+
+# --- Evaluation ---
+evaluation_greedy: False # Evaluate the policy greedily. If True the policy will select
+  # an action which corresponds to the greatest logit. If false, the policy will sample
+  # from the logits.
+num_eval_episodes: 128 # Number of episodes to evaluate per evaluation.
+num_evaluation: 20 # Number of evenly spaced evaluations to perform during training.
+absolute_metric: True # Whether the absolute metric should be computed. For more details
+  # on the absolute metric please see: https://arxiv.org/abs/2209.10485
+</file>
+
+<file path="stoix/networks/base.py">
+import functools
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+
+import chex
+import distrax
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax import linen as nn
+
+from stoix.base_types import Observation, RNNObservation
+from stoix.networks.inputs import ArrayInput
+from stoix.networks.utils import parse_rnn_cell
+
+
+class FeedForwardActor(nn.Module):
+    """Simple Feedforward Actor Network."""
+
+    action_head: nn.Module
+    torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: Observation,
+        input_kwargs: Optional[Dict] = None,
+        torso_kwargs: Optional[Dict] = None,
+        head_kwargs: Optional[Dict] = None,
+    ) -> distrax.DistributionLike:
+
+        obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        obs_embedding = self.torso(obs_embedding, **(torso_kwargs or {}))
+        return self.action_head(obs_embedding, **(head_kwargs or {}))
+
+
+class FeedForwardCritic(nn.Module):
+    """Simple Feedforward Critic Network."""
+
+    critic_head: nn.Module
+    torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: Observation,
+        input_kwargs: Optional[Dict] = None,
+        torso_kwargs: Optional[Dict] = None,
+        head_kwargs: Optional[Dict] = None,
+    ) -> chex.Array:
+
+        obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        obs_embedding = self.torso(obs_embedding, **(torso_kwargs or {}))
+        critic_output = self.critic_head(obs_embedding, **(head_kwargs or {}))
+
+        return critic_output
+
+
+class FeedForwardActorCritic(nn.Module):
+    """Simple Feedforward Joint Actor Critic Network."""
+
+    action_head: nn.Module
+    critic_head: nn.Module
+    torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        observation: Observation,
+        input_kwargs: Optional[Dict] = None,
+        torso_kwargs: Optional[Dict] = None,
+        actor_head_kwargs: Optional[Dict] = None,
+        critic_head_kwargs: Optional[Dict] = None,
+    ) -> chex.Array:
+
+        obs_embedding = self.input_layer(observation, **(input_kwargs or {}))
+        obs_embedding = self.torso(obs_embedding, **(torso_kwargs or {}))
+        actor_output = self.action_head(obs_embedding, **(actor_head_kwargs or {}))
+        critic_output = self.critic_head(obs_embedding, **(critic_head_kwargs or {}))
+
+        return actor_output, critic_output
+
+
+class CompositeNetwork(nn.Module):
+    """Composite Network. Takes in a sequence of layers and applies them sequentially."""
+
+    layers: Sequence[nn.Module]
+
+    @nn.compact
+    def __call__(
+        self, *network_input: Union[chex.Array, Tuple[chex.Array, ...]]
+    ) -> Union[distrax.DistributionLike, chex.Array]:
+
+        x = self.layers[0](*network_input)
+        for layer in self.layers[1:]:
+            x = layer(x)
+        return x
+
+
+class MultiNetwork(nn.Module):
+    """Multi Network.
+
+    Takes in a sequence of networks, applies them separately and concatenates the outputs."""
+
+    networks: Sequence[nn.Module]
+
+    @nn.compact
+    def __call__(
+        self, *network_input: Union[chex.Array, Tuple[chex.Array, ...]]
+    ) -> Union[distrax.DistributionLike, chex.Array]:
+        """Forward pass."""
+        outputs = []
+        for network in self.networks:
+            outputs.append(network(*network_input))
+        concatenated = jnp.stack(outputs, axis=-1)
+        chex.assert_rank(concatenated, 2)
+        return concatenated
+
+
+class ScannedRNN(nn.Module):
+    hidden_state_dim: int
+    cell_type: str
+
+    @functools.partial(
+        nn.scan,
+        variable_broadcast="params",
+        in_axes=0,
+        out_axes=0,
+        split_rngs={"params": False},
+    )
+    @nn.compact
+    def __call__(self, rnn_state: chex.Array, x: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        """Applies the module."""
+        ins, resets = x
+        hidden_state_reset_fn = lambda reset_state, current_state: jnp.where(
+            resets[:, np.newaxis],
+            reset_state,
+            current_state,
+        )
+        rnn_state = jax.tree_util.tree_map(
+            hidden_state_reset_fn,
+            self.initialize_carry(ins.shape[0]),
+            rnn_state,
+        )
+        new_rnn_state, y = parse_rnn_cell(self.cell_type)(features=self.hidden_state_dim)(
+            rnn_state, ins
+        )
+        return new_rnn_state, y
+
+    @nn.nowrap
+    def initialize_carry(self, batch_size: int) -> chex.Array:
+        """Initializes the carry state."""
+        # Use a dummy key since the default state init fn is just zeros.
+        cell = parse_rnn_cell(self.cell_type)(features=self.hidden_state_dim)
+        return cell.initialize_carry(jax.random.PRNGKey(0), (batch_size, self.hidden_state_dim))
+
+
+class RecurrentActor(nn.Module):
+    """Recurrent Actor Network."""
+
+    action_head: nn.Module
+    post_torso: nn.Module
+    hidden_state_dim: int
+    cell_type: str
+    pre_torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        policy_hidden_state: chex.Array,
+        observation_done: RNNObservation,
+    ) -> Tuple[chex.Array, distrax.DistributionLike]:
+
+        observation, done = observation_done
+
+        observation = self.input_layer(observation)
+        policy_embedding = self.pre_torso(observation)
+        policy_rnn_input = (policy_embedding, done)
+        policy_hidden_state, policy_embedding = ScannedRNN(self.hidden_state_dim, self.cell_type)(
+            policy_hidden_state, policy_rnn_input
+        )
+        actor_logits = self.post_torso(policy_embedding)
+        pi = self.action_head(actor_logits)
+
+        return policy_hidden_state, pi
+
+
+class RecurrentCritic(nn.Module):
+    """Recurrent Critic Network."""
+
+    critic_head: nn.Module
+    post_torso: nn.Module
+    hidden_state_dim: int
+    cell_type: str
+    pre_torso: nn.Module
+    input_layer: nn.Module = ArrayInput()
+
+    @nn.compact
+    def __call__(
+        self,
+        critic_hidden_state: Tuple[chex.Array, chex.Array],
+        observation_done: RNNObservation,
+    ) -> Tuple[chex.Array, chex.Array]:
+
+        observation, done = observation_done
+
+        observation = self.input_layer(observation)
+
+        critic_embedding = self.pre_torso(observation)
+        critic_rnn_input = (critic_embedding, done)
+        critic_hidden_state, critic_embedding = ScannedRNN(self.hidden_state_dim, self.cell_type)(
+            critic_hidden_state, critic_rnn_input
+        )
+        critic_output = self.post_torso(critic_embedding)
+        critic_output = self.critic_head(critic_output)
+
+        return critic_hidden_state, critic_output
+
+
+def chained_torsos(torso_cfgs: List[Dict[str, Any]]) -> nn.Module:
+    """Create a network by chaining multiple torsos together using a list of configs.
+    This makes use of hydra to instantiate the modules and the composite network
+    to chain them together.
+
+    Args:
+        torso_cfgs: List of dictionaries containing the configuration for each torso.
+            These configs should use the same format as the individual torso configs."""
+
+    torso_modules = [hydra.utils.instantiate(torso_cfg) for torso_cfg in torso_cfgs]
+    return CompositeNetwork(torso_modules)
+</file>
+
+<file path="stoix/networks/torso.py">
+from typing import Sequence
+
+import chex
+import numpy as np
+from flax import linen as nn
+from flax.linen.initializers import Initializer, orthogonal
+
+from stoix.networks.layers import NoisyLinear
+from stoix.networks.utils import parse_activation_fn
+
+
+class MLPTorso(nn.Module):
+    """MLP torso."""
+
+    layer_sizes: Sequence[int]
+    activation: str = "relu"
+    use_layer_norm: bool = False
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    activate_final: bool = True
+
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        """Forward pass."""
+        x = observation
+        for layer_size in self.layer_sizes:
+            x = nn.Dense(
+                layer_size, kernel_init=self.kernel_init, use_bias=not self.use_layer_norm
+            )(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
+            if self.activate_final or layer_size != self.layer_sizes[-1]:
+                x = parse_activation_fn(self.activation)(x)
+        return x
+
+
+class NoisyMLPTorso(nn.Module):
+    """MLP torso using NoisyLinear layers instead of standard Dense layers."""
+
+    layer_sizes: Sequence[int]
+    activation: str = "relu"
+    use_layer_norm: bool = False
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    activate_final: bool = True
+    sigma_zero: float = 0.5
+
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        x = observation
+        for layer_size in self.layer_sizes:
+            x = NoisyLinear(
+                layer_size, sigma_zero=self.sigma_zero, use_bias=not self.use_layer_norm
+            )(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
+            if self.activate_final or layer_size != self.layer_sizes[-1]:
+                x = parse_activation_fn(self.activation)(x)
+        return x
+
+
+class CNNTorso(nn.Module):
+    """2D CNN torso. Expects input of shape (batch, height, width, channels).
+    After this torso, the output is flattened and put through an MLP of
+    hidden_sizes."""
+
+    channel_sizes: Sequence[int]
+    kernel_sizes: Sequence[int]
+    strides: Sequence[int]
+    activation: str = "relu"
+    use_layer_norm: bool = False
+    kernel_init: Initializer = orthogonal(np.sqrt(2.0))
+    channel_first: bool = False
+    hidden_sizes: Sequence[int] = (256,)
+
+    @nn.compact
+    def __call__(self, observation: chex.Array) -> chex.Array:
+        """Forward pass."""
+        x = observation
+
+        # If there is a batch of sequences of images
+        if observation.ndim > 4:
+            return nn.batch_apply.BatchApply(self.__call__)(observation)
+
+        # If the input is in the form of [B, C, H, W], we need to transpose it to [B, H, W, C]
+        if self.channel_first:
+            x = x.transpose((0, 2, 3, 1))
+
+        # Convolutional layers
+        for channel, kernel, stride in zip(self.channel_sizes, self.kernel_sizes, self.strides):
+            x = nn.Conv(
+                channel, (kernel, kernel), (stride, stride), use_bias=not self.use_layer_norm
+            )(x)
+            if self.use_layer_norm:
+                x = nn.LayerNorm(reduction_axes=(-3, -2, -1))(x)
+            x = parse_activation_fn(self.activation)(x)
+
+        # Flatten
+        x = x.reshape(*observation.shape[:-3], -1)
+
+        # MLP layers
+        x = MLPTorso(
+            layer_sizes=self.hidden_sizes,
+            activation=self.activation,
+            use_layer_norm=self.use_layer_norm,
+            kernel_init=self.kernel_init,
+            activate_final=True,
+        )(x)
+
+        return x
+</file>
+
+<file path="stoix/systems/ppo/anakin/ff_ppo.py">
+import copy
+import time
+from typing import Any, Tuple
+
+import chex
+import flax
+import hydra
+import jax
+import jax.numpy as jnp
+import optax
+from colorama import Fore, Style
+from flax.core.frozen_dict import FrozenDict
+from omegaconf import DictConfig, OmegaConf
+from stoa import Environment, get_final_step_metrics
+
+from stoix.base_types import (
+    ActorApply,
+    ActorCriticOptStates,
+    ActorCriticParams,
+    AnakinExperimentOutput,
+    CriticApply,
+    LearnerFn,
+    OnPolicyLearnerState,
+)
+from stoix.evaluator import evaluator_setup, get_distribution_act_fn
+from stoix.networks.base import FeedForwardActor as Actor
+from stoix.networks.base import FeedForwardCritic as Critic
+from stoix.systems.ppo.ppo_types import PPOTransition
+from stoix.utils import make_env as environments
+from stoix.utils.checkpointing import Checkpointer
+from stoix.utils.jax_utils import (
+    merge_leading_dims,
+    unreplicate_batch_dim,
+    unreplicate_n_dims,
+)
+from stoix.utils.logger import LogEvent, StoixLogger
+from stoix.utils.loss import clipped_value_loss, ppo_clip_loss
+from stoix.utils.multistep import batch_truncated_generalized_advantage_estimation
+from stoix.utils.running_statistics import (
+    create_with_running_statistics,
+    initialize_statistics_from_data,
+    normalize,
+    update_statistics,
+)
+from stoix.utils.total_timestep_checker import check_total_timesteps
+from stoix.utils.training import make_learning_rate
+
+
+def get_learner_fn(
+    env: Environment,
+    apply_fns: Tuple[ActorApply, CriticApply],
+    update_fns: Tuple[optax.TransformUpdateFn, optax.TransformUpdateFn],
+    config: DictConfig,
+) -> LearnerFn[OnPolicyLearnerState]:
+    """Get the learner function."""
+
+    # Get apply and update functions for actor and critic networks.
+    actor_apply_fn, critic_apply_fn = apply_fns
+    actor_update_fn, critic_update_fn = update_fns
+
+    def _update_step(
+        learner_state: OnPolicyLearnerState, _: Any
+    ) -> Tuple[OnPolicyLearnerState, Tuple]:
+        """A single update of the network.
+
+        This function steps the environment and records the trajectory batch for
+        training. It then calculates advantages and targets based on the recorded
+        trajectory and updates the actor and critic networks based on the calculated
+        losses.
+
+        Args:
+            learner_state (NamedTuple):
+                - params (ActorCriticParams): The current model parameters.
+                - opt_states (OptStates): The current optimizer states.
+                - key (PRNGKey): The random number generator state.
+                - env_state (State): The environment state.
+                - last_timestep (TimeStep): The last timestep in the current trajectory.
+            _ (Any): The current metrics info.
+        """
+
+        def _env_step(
+            learner_state: OnPolicyLearnerState, _: Any
+        ) -> Tuple[OnPolicyLearnerState, PPOTransition]:
+            """Step the environment."""
+            params, opt_states, key, env_state, last_timestep = learner_state
+
+            # GET OBSERVATION
+            observation = last_timestep.observation
+
+            # Get running statistics if normalizing observations.
+            # It would not be present if observation normalization is not implemented/setup.
+            running_statistics = getattr(learner_state, "running_statistics", None)
+            if running_statistics is not None:
+                observation = normalize(observation, running_statistics)
+
+            # SELECT ACTION
+            key, policy_key = jax.random.split(key)
+            actor_policy = actor_apply_fn(params.actor_params, observation)
+            value = critic_apply_fn(params.critic_params, observation)
+            action = actor_policy.sample(seed=policy_key)
+            log_prob = actor_policy.log_prob(action)
+
+            # STEP ENVIRONMENT
+            env_state, timestep = env.step(env_state, action)
+
+            # LOG EPISODE METRICS
+            done = (timestep.discount == 0.0).reshape(-1)
+            truncated = (timestep.last() & (timestep.discount != 0.0)).reshape(-1)
+            info = timestep.extras["episode_metrics"]
+            # Save bootstrap value for the next step.
+            # Due to auto-resetting and truncation, we have to specifically save the bootstrap value
+            # for the next (potentially final) observation.
+            bootstrap_obs = timestep.extras["next_obs"]
+            if running_statistics is not None:
+                bootstrap_obs = normalize(bootstrap_obs, running_statistics)
+            bootstrap_value = critic_apply_fn(params.critic_params, bootstrap_obs)
+
+            transition = PPOTransition(
+                done,
+                truncated,
+                action,
+                value,
+                timestep.reward,
+                bootstrap_value,
+                log_prob,
+                last_timestep.observation,
+                info,
+            )
+            # Replace the learner state with the new environment state and timestep.
+            learner_state = learner_state._replace(
+                key=key,
+                env_state=env_state,
+                timestep=timestep,
+            )
+            return learner_state, transition
+
+        # STEP ENVIRONMENT FOR ROLLOUT LENGTH
+        learner_state, traj_batch = jax.lax.scan(
+            _env_step, learner_state, None, config.system.rollout_length
+        )
+
+        # UNPACK LEARNER STATE
+        params, opt_states, key, _, _ = learner_state
+
+        # IF NORMALIZING OBSERVATIONS, UPDATE RUNNING STATISTICS
+        running_statistics = getattr(learner_state, "running_statistics", None)
+        if running_statistics is not None:
+            # We get the raw observations from the trajectory batch.
+            raw_obs = traj_batch.obs
+            # We normalize with pre-updated statistics
+            normalized_obs = normalize(traj_batch.obs, running_statistics)
+            # Update running statistics
+            running_statistics = update_statistics(
+                running_statistics,
+                raw_obs,
+                pmap_axes=["device", "batch"],
+                std_min_value=5e-4,
+                std_max_value=5e4,
+            )
+            learner_state = learner_state._replace(running_statistics=running_statistics)  # type: ignore
+            # We then replace the observations in the trajectory batch with the normalized ones.
+            traj_batch = traj_batch._replace(obs=normalized_obs)
+
+        # CALCULATE ADVANTAGE
+        v_tm1 = traj_batch.value
+        r_t = traj_batch.reward * config.system.reward_scale
+        v_t = traj_batch.bootstrap_value
+        d_t = 1.0 - traj_batch.done.astype(jnp.float32)
+        d_t = (d_t * config.system.gamma).astype(jnp.float32)
+        advantages, targets = batch_truncated_generalized_advantage_estimation(
+            r_t,
+            d_t,
+            config.system.gae_lambda,
+            v_tm1=v_tm1,
+            v_t=v_t,
+            time_major=True,
+            standardize_advantages=config.system.standardize_advantages,
+            truncation_t=traj_batch.truncated,
+        )
+
+        def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
+            """Update the network for a single epoch."""
+
+            def _update_minibatch(train_state: Tuple, batch_info: Tuple) -> Tuple:
+                """Update the network for a single minibatch."""
+
+                # UNPACK TRAIN STATE AND BATCH INFO
+                params, opt_states = train_state
+                traj_batch, advantages, targets = batch_info
+
+                def _actor_loss_fn(
+                    actor_params: FrozenDict,
+                    traj_batch: PPOTransition,
+                    gae: chex.Array,
+                ) -> Tuple:
+                    """Calculate the actor loss."""
+                    # RERUN NETWORK
+                    actor_policy = actor_apply_fn(actor_params, traj_batch.obs)
+                    log_prob = actor_policy.log_prob(traj_batch.action)
+
+                    # CALCULATE ACTOR LOSS
+                    loss_actor = ppo_clip_loss(
+                        log_prob, traj_batch.log_prob, gae, config.system.clip_eps
+                    )
+                    entropy = actor_policy.entropy().mean()
+
+                    total_loss_actor = loss_actor - config.system.ent_coef * entropy
+                    loss_info = {
+                        "actor_loss": loss_actor,
+                        "entropy": entropy,
+                        "advantages": gae,
+                    }
+                    return total_loss_actor, loss_info
+
+                def _critic_loss_fn(
+                    critic_params: FrozenDict,
+                    traj_batch: PPOTransition,
+                    targets: chex.Array,
+                ) -> Tuple:
+                    """Calculate the critic loss."""
+                    # RERUN NETWORK
+                    value = critic_apply_fn(critic_params, traj_batch.obs)
+
+                    # CALCULATE VALUE LOSS
+                    value_loss = clipped_value_loss(
+                        value, traj_batch.value, targets, config.system.clip_eps
+                    )
+
+                    critic_total_loss = config.system.vf_coef * value_loss
+                    loss_info = {
+                        "value_loss": value_loss,
+                        "pred_value": value,
+                        "target_value": targets,
+                    }
+                    return critic_total_loss, loss_info
+
+                # CALCULATE ACTOR LOSS
+                actor_grad_fn = jax.grad(_actor_loss_fn, has_aux=True)
+                actor_grads, actor_loss_info = actor_grad_fn(
+                    params.actor_params, traj_batch, advantages
+                )
+
+                # CALCULATE CRITIC LOSS
+                critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
+                critic_grads, critic_loss_info = critic_grad_fn(
+                    params.critic_params, traj_batch, targets
+                )
+
+                # Compute the parallel mean (pmean) over the batch.
+                # This calculation is inspired by the Anakin architecture demo notebook.
+                # available at https://tinyurl.com/26tdzs5x
+                # This pmean could be a regular mean as the batch axis is on the same device.
+                actor_grads, actor_loss_info, critic_grads, critic_loss_info = jax.lax.pmean(
+                    (actor_grads, actor_loss_info, critic_grads, critic_loss_info),
+                    axis_name="batch",
+                )
+                # pmean over devices.
+                actor_grads, actor_loss_info, critic_grads, critic_loss_info = jax.lax.pmean(
+                    (actor_grads, actor_loss_info, critic_grads, critic_loss_info),
+                    axis_name="device",
+                )
+
+                # UPDATE ACTOR PARAMS AND OPTIMISER STATE
+                actor_updates, actor_new_opt_state = actor_update_fn(
+                    actor_grads, opt_states.actor_opt_state
+                )
+                actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
+
+                # UPDATE CRITIC PARAMS AND OPTIMISER STATE
+                critic_updates, critic_new_opt_state = critic_update_fn(
+                    critic_grads, opt_states.critic_opt_state
+                )
+                critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+
+                # PACK NEW PARAMS AND OPTIMISER STATE
+                new_params = ActorCriticParams(actor_new_params, critic_new_params)
+                new_opt_state = ActorCriticOptStates(actor_new_opt_state, critic_new_opt_state)
+
+                # PACK LOSS INFO
+                loss_info = {
+                    **actor_loss_info,
+                    **critic_loss_info,
+                }
+                return (new_params, new_opt_state), loss_info
+
+            (
+                params,
+                opt_states,
+                traj_batch,
+                advantages,
+                targets,
+                key,
+            ) = update_state
+            key, shuffle_key = jax.random.split(key)
+
+            # SHUFFLE MINIBATCHES
+            batch_size = config.system.rollout_length * config.arch.num_envs
+            permutation = jax.random.permutation(shuffle_key, batch_size)
+            batch = (traj_batch, advantages, targets)
+            batch = jax.tree_util.tree_map(lambda x: merge_leading_dims(x, 2), batch)
+            shuffled_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), batch
+            )
+            minibatches = jax.tree_util.tree_map(
+                lambda x: jnp.reshape(x, [config.system.num_minibatches, -1] + list(x.shape[1:])),
+                shuffled_batch,
+            )
+
+            # UPDATE MINIBATCHES
+            (params, opt_states), loss_info = jax.lax.scan(
+                _update_minibatch, (params, opt_states), minibatches
+            )
+
+            update_state = (
+                params,
+                opt_states,
+                traj_batch,
+                advantages,
+                targets,
+                key,
+            )
+            return update_state, loss_info
+
+        update_state = (
+            params,
+            opt_states,
+            traj_batch,
+            advantages,
+            targets,
+            key,
+        )
+
+        # UPDATE EPOCHS
+        update_state, loss_info = jax.lax.scan(
+            _update_epoch, update_state, None, config.system.epochs
+        )
+
+        params, opt_states, traj_batch, advantages, targets, key = update_state
+        learner_state = learner_state._replace(params=params, opt_states=opt_states, key=key)
+        metric = traj_batch.info
+        return learner_state, (metric, loss_info)
+
+    def learner_fn(
+        learner_state: OnPolicyLearnerState,
+    ) -> AnakinExperimentOutput[OnPolicyLearnerState]:
+        """Learner function.
+
+        This function represents the learner, it updates the network parameters
+        by iteratively applying the `_update_step` function for a fixed number of
+        updates. The `_update_step` function is vectorized over a batch of inputs.
+
+        Args:
+            learner_state (NamedTuple):
+                - params (ActorCriticParams): The initial model parameters.
+                - opt_states (OptStates): The initial optimizer state.
+                - key (chex.PRNGKey): The random number generator state.
+                - env_state (WrapperState): The environment state.
+                - timesteps (TimeStep): The initial timestep in the initial trajectory.
+        """
+
+        batched_update_step = jax.vmap(_update_step, in_axes=(0, None), axis_name="batch")
+
+        learner_state, (episode_info, loss_info) = jax.lax.scan(
+            batched_update_step, learner_state, None, config.arch.num_updates_per_eval
+        )
+        return AnakinExperimentOutput(
+            learner_state=learner_state,
+            episode_metrics=episode_info,
+            train_metrics=loss_info,
+        )
+
+    return learner_fn
+
+
+def _collect_obs_norm_rollouts(
+    env: Environment,
+    key: chex.PRNGKey,
+    config: DictConfig,
+) -> chex.ArrayTree:
+    """Collect observations for observation normalization.
+    This function collects observations from the environment by taking random actions
+    for a specified number of warmup steps."""
+    num_warmup_obs = config.system.obs_norm_warmup_steps * config.arch.total_num_envs
+    print(
+        f"{Fore.YELLOW}{Style.BRIGHT}Initializing observation normalization with "
+        f"{num_warmup_obs} observations..."
+        f"Be aware, we do not count this in the timestep budget.{Style.RESET_ALL}"
+    )
+
+    @jax.jit
+    def _warmup_step(env_state: Any, step_key: chex.PRNGKey) -> Tuple[Any, chex.ArrayTree]:
+        """Single warmup step: random action -> environment step -> collect observation."""
+        action = jax.random.randint(
+            step_key, (config.arch.total_num_envs,), 0, config.system.action_dim
+        )
+        env_state, timestep = env.step(env_state, action)
+        return env_state, timestep.observation
+
+    # Initialize environments for data collection
+    key, *env_keys = jax.random.split(key, config.arch.total_num_envs + 1)
+    env_states, initial_timesteps = env.reset(jnp.stack(env_keys))
+
+    # Collect warmup observations through random actions
+    step_keys = jax.random.split(key, config.system.obs_norm_warmup_steps)
+    _, warmup_observations = jax.lax.scan(_warmup_step, env_states, step_keys)
+
+    # Combine initial reset observations with warmup observations
+    all_observations = jax.tree.map(
+        lambda reset_obs, warmup_obs: jnp.concatenate(
+            [
+                reset_obs[
+                    jnp.newaxis,
+                ],
+                warmup_obs,
+            ],
+            axis=0,
+        ),
+        initial_timesteps.observation,
+        warmup_observations,
+    )
+    return all_observations
+
+
+def learner_setup(
+    env: Environment, keys: chex.Array, config: DictConfig
+) -> Tuple[LearnerFn[OnPolicyLearnerState], Actor, OnPolicyLearnerState]:
+    """Initialise learner_fn, network, optimiser, environment and states."""
+    # Get available TPU cores.
+    n_devices = len(jax.devices())
+
+    # Get number/dimension of actions.
+    num_actions = int(env.action_space().num_values)
+    config.system.action_dim = num_actions
+
+    # PRNG keys.
+    key, actor_net_key, critic_net_key = keys
+
+    # Define network and optimiser.
+    actor_torso = hydra.utils.instantiate(config.network.actor_network.pre_torso)
+    actor_action_head = hydra.utils.instantiate(
+        config.network.actor_network.action_head, action_dim=num_actions
+    )
+    critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
+    critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
+
+    actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
+    critic_network = Critic(torso=critic_torso, critic_head=critic_head)
+
+    actor_lr = make_learning_rate(
+        config.system.actor_lr, config, config.system.epochs, config.system.num_minibatches
+    )
+    critic_lr = make_learning_rate(
+        config.system.critic_lr, config, config.system.epochs, config.system.num_minibatches
+    )
+
+    actor_optim = optax.chain(
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(actor_lr, eps=1e-5),
+    )
+    critic_optim = optax.chain(
+        optax.clip_by_global_norm(config.system.max_grad_norm),
+        optax.adam(critic_lr, eps=1e-5),
+    )
+
+    # Initialise observation
+    init_x = env.observation_space().generate_value()
+    init_x = jax.tree_util.tree_map(lambda x: x[None, ...], init_x)
+
+    # Initialise actor params and optimiser state.
+    actor_params = actor_network.init(actor_net_key, init_x)
+    actor_opt_state = actor_optim.init(actor_params)
+
+    # Initialise critic params and optimiser state.
+    critic_params = critic_network.init(critic_net_key, init_x)
+    critic_opt_state = critic_optim.init(critic_params)
+
+    # Pack params.
+    params = ActorCriticParams(actor_params, critic_params)
+
+    actor_network_apply_fn = actor_network.apply
+    critic_network_apply_fn = critic_network.apply
+
+    # Pack apply and update functions.
+    apply_fns = (actor_network_apply_fn, critic_network_apply_fn)
+    update_fns = (actor_optim.update, critic_optim.update)
+
+    # Get batched iterated update and replicate it to pmap it over cores.
+    learn = get_learner_fn(env, apply_fns, update_fns, config)
+    learn = jax.pmap(learn, axis_name="device")
+
+    # Initialise environment states and timesteps: across devices and batches.
+    key, *env_keys = jax.random.split(
+        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
+    )
+    env_states, timesteps = env.reset(jnp.stack(env_keys))
+    reshape_states = lambda x: x.reshape(
+        (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
+    )
+    # (devices, update batch size, num_envs, ...)
+    env_states = jax.tree_util.tree_map(reshape_states, env_states)
+    timesteps = jax.tree_util.tree_map(reshape_states, timesteps)
+
+    # Load model from checkpoint if specified.
+    if config.logger.checkpointing.load_model:
+        loaded_checkpoint = Checkpointer(
+            model_name=config.system.system_name,
+            **config.logger.checkpointing.load_args,  # Other checkpoint args
+        )
+        # Restore the learner state from the checkpoint
+        restored_params, _ = loaded_checkpoint.restore_params(input_params=params)
+        # Update the params
+        params = restored_params
+
+    # Define params to be replicated across devices and batches.
+    key, step_key = jax.random.split(key)
+    step_keys = jax.random.split(step_key, n_devices * config.arch.update_batch_size)
+    reshape_keys = lambda x: x.reshape((n_devices, config.arch.update_batch_size) + x.shape[1:])
+    step_keys = reshape_keys(jnp.stack(step_keys))
+    opt_states = ActorCriticOptStates(actor_opt_state, critic_opt_state)
+    replicate_learner = (params, opt_states)
+
+    # Duplicate learner for update_batch_size.
+    broadcast = lambda x: jnp.broadcast_to(x, (config.arch.update_batch_size,) + x.shape)
+    replicate_learner = jax.tree_util.tree_map(broadcast, replicate_learner)
+
+    # Duplicate learner across devices.
+    replicate_learner = flax.jax_utils.replicate(replicate_learner, devices=jax.devices())
+
+    # Initialise learner state.
+    params, opt_states = replicate_learner
+    init_learner_state = OnPolicyLearnerState(
+        params=params,
+        opt_states=opt_states,
+        key=step_keys,
+        env_state=env_states,
+        timestep=timesteps,
+    )
+
+    # If normalizing observations, initialize running statistics.
+    # This will add running statistics to the learner state.
+    if config.system.normalize_observations:
+        dummy_obs = jax.tree.map(lambda x: x.squeeze(0), init_x)
+        warmup_observations = _collect_obs_norm_rollouts(env, key, config)
+        running_statistics = initialize_statistics_from_data(dummy_obs, warmup_observations)
+        running_statistics = jax.tree.map(broadcast, running_statistics)
+        running_statistics = flax.jax_utils.replicate(running_statistics, devices=jax.devices())
+        init_learner_state = create_with_running_statistics(
+            state=init_learner_state, running_statistics=running_statistics
+        )
+
+    return learn, actor_network, init_learner_state
+
+
+def run_experiment(_config: DictConfig) -> float:
+    """Runs experiment."""
+    config = copy.deepcopy(_config)
+
+    # Calculate total timesteps.
+    n_devices = len(jax.devices())
+    config.num_devices = n_devices
+    config = check_total_timesteps(config)
+    assert (
+        config.arch.num_updates >= config.arch.num_evaluation
+    ), "Number of updates per evaluation must be less than total number of updates."
+
+    # Create the environments for train and eval.
+    env, eval_env = environments.make(config=config)
+
+    # PRNG keys.
+    key, key_e, actor_net_key, critic_net_key = jax.random.split(
+        jax.random.PRNGKey(config.arch.seed), num=4
+    )
+
+    # Setup learner.
+    learn, actor_network, learner_state = learner_setup(
+        env, (key, actor_net_key, critic_net_key), config
+    )
+
+    # Setup evaluator.
+    evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
+        eval_env=eval_env,
+        key_e=key_e,
+        eval_act_fn=get_distribution_act_fn(config, actor_network.apply),
+        params=learner_state.params.actor_params,
+        config=config,
+    )
+
+    # Calculate environment steps per evaluation.
+    steps_per_rollout = (
+        n_devices
+        * config.arch.num_updates_per_eval
+        * config.system.rollout_length
+        * config.arch.update_batch_size
+        * config.arch.num_envs
+    )
+
+    # Logger setup
+    logger = StoixLogger(config)
+    logger.log_config(OmegaConf.to_container(config, resolve=True))
+    print(f"{Fore.YELLOW}{Style.BRIGHT}JAX Global Devices {jax.devices()}{Style.RESET_ALL}")
+
+    # Set up checkpointer
+    save_checkpoint = config.logger.checkpointing.save_model
+    if save_checkpoint:
+        checkpointer = Checkpointer(
+            metadata=config,  # Save all config as metadata in the checkpoint
+            model_name=config.system.system_name,
+            **config.logger.checkpointing.save_args,  # Checkpoint args
+        )
+
+    # Run experiment for a total number of evaluations.
+    max_episode_return = -jnp.inf
+    best_learner_state = unreplicate_batch_dim(learner_state)
+    for eval_step in range(config.arch.num_evaluation):
+        # Train.
+        start_time = time.time()
+
+        learner_output = learn(learner_state)
+        jax.block_until_ready(learner_output)
+
+        # Log the results of the training.
+        elapsed_time = time.time() - start_time
+        t = int(steps_per_rollout * (eval_step + 1))
+        episode_metrics, ep_completed = get_final_step_metrics(learner_output.episode_metrics)
+        episode_metrics["steps_per_second"] = steps_per_rollout / elapsed_time
+
+        # Separately log timesteps, actoring metrics and training metrics.
+        logger.log({"timestep": t}, t, eval_step, LogEvent.MISC)
+        if ep_completed:  # only log episode metrics if an episode was completed in the rollout.
+            logger.log(episode_metrics, t, eval_step, LogEvent.ACT)
+        train_metrics = learner_output.train_metrics
+        # Calculate the number of optimiser steps per second. Since gradients are aggregated
+        # across the device and batch axis, we don't consider updates per device/batch as part of
+        # the SPS for the learner.
+        opt_steps_per_eval = config.arch.num_updates_per_eval * (
+            config.system.epochs * config.system.num_minibatches
+        )
+        train_metrics["steps_per_second"] = opt_steps_per_eval / elapsed_time
+        logger.log(train_metrics, t, eval_step, LogEvent.TRAIN)
+
+        # Prepare for evaluation.
+        start_time = time.time()
+        trained_params = unreplicate_batch_dim(
+            learner_output.learner_state.params.actor_params
+        )  # Select only actor params
+        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+        eval_keys = jnp.stack(eval_keys)
+        eval_keys = eval_keys.reshape(n_devices, -1)
+
+        # Evaluate.
+        running_statistics = getattr(learner_output.learner_state, "running_statistics", None)
+        if running_statistics is not None:
+            running_statistics = unreplicate_batch_dim(running_statistics)
+        evaluator_output = evaluator(trained_params, eval_keys, running_statistics)
+        jax.block_until_ready(evaluator_output)
+
+        # Log the results of the evaluation.
+        elapsed_time = time.time() - start_time
+        episode_return = jnp.mean(evaluator_output.episode_metrics["episode_return"])
+
+        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
+        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.EVAL)
+
+        if save_checkpoint:
+            # Save checkpoint of learner state
+            checkpointer.save(
+                timestep=int(steps_per_rollout * (eval_step + 1)),
+                unreplicated_learner_state=unreplicate_n_dims(learner_output.learner_state),
+                episode_return=episode_return,
+            )
+
+        if config.arch.absolute_metric and max_episode_return <= episode_return:
+            best_learner_state = copy.deepcopy(unreplicate_batch_dim(learner_state))
+            max_episode_return = episode_return
+
+        # Update runner state to continue training.
+        learner_state = learner_output.learner_state
+
+    # Measure absolute metric.
+    if config.arch.absolute_metric:
+        start_time = time.time()
+
+        key_e, *eval_keys = jax.random.split(key_e, n_devices + 1)
+        eval_keys = jnp.stack(eval_keys)
+        eval_keys = eval_keys.reshape(n_devices, -1)
+
+        best_params = best_learner_state.params.actor_params
+        best_running_statistics = getattr(best_learner_state, "running_statistics", None)
+        evaluator_output = absolute_metric_evaluator(
+            best_params, eval_keys, best_running_statistics
+        )
+        jax.block_until_ready(evaluator_output)
+
+        elapsed_time = time.time() - start_time
+        t = int(steps_per_rollout * (eval_step + 1))
+        steps_per_eval = int(jnp.sum(evaluator_output.episode_metrics["episode_length"]))
+        evaluator_output.episode_metrics["steps_per_second"] = steps_per_eval / elapsed_time
+        logger.log(evaluator_output.episode_metrics, t, eval_step, LogEvent.ABSOLUTE)
+
+    # Stop the logger.
+    logger.stop()
+    # Record the performance for the final evaluation run. If the absolute metric is not
+    # calculated, this will be the final evaluation run.
+    eval_performance = float(jnp.mean(evaluator_output.episode_metrics[config.env.eval_metric]))
+    return eval_performance
+
+
+@hydra.main(
+    config_path="../../../configs/default/anakin",
+    config_name="default_ff_ppo.yaml",
+    version_base="1.2",
+)
+def hydra_entry_point(cfg: DictConfig) -> float:
+    """Experiment entry point."""
+    # Allow dynamic attributes.
+    OmegaConf.set_struct(cfg, False)
+
+    # Run experiment.
+    t0 = time.time()
+    eval_performance = run_experiment(cfg)
+
+    print(
+        f"{Fore.CYAN}{Style.BRIGHT}PPO experiment completed in "
+        f"{time.time() - t0:.2f} seconds.{Style.RESET_ALL}"
+    )
+    return eval_performance
+
+
+if __name__ == "__main__":
+    hydra_entry_point()
+</file>
+
+<file path="stoix/base_types.py">
+from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar
+
+import chex
+from distrax import DistributionLike
+from flashbax.buffers.trajectory_buffer import BufferState
+from flax.core.frozen_dict import FrozenDict
+from optax import OptState
+from stoa import TimeStep, WrapperState
+from typing_extensions import NamedTuple, Protocol, TypeAlias, runtime_checkable
+
+from stoix.utils.running_statistics import RunningStatisticsState
+
+Action: TypeAlias = chex.Array
+Value: TypeAlias = chex.Array
+Done: TypeAlias = chex.Array
+Truncated: TypeAlias = chex.Array
+First: TypeAlias = chex.Array
+HiddenState: TypeAlias = chex.Array
+LogProb: TypeAlias = chex.Array
+Reward: TypeAlias = chex.Array
+# Can't know the exact type of State.
+State: TypeAlias = Any
+Parameters: TypeAlias = Any
+OptStates: TypeAlias = Any
+HiddenStates: TypeAlias = Any
+Metrics: TypeAlias = chex.ArrayTree
+
+
+EvalResetFn = Callable[[chex.PRNGKey, int], Tuple[State, TimeStep]]
+
+
+class Observation(NamedTuple):
+    """The observation that the agent sees.
+    agent_view: the agent's view of the environment.
+    action_mask: boolean array specifying which action is legal.
+    step_count: the number of steps elapsed since the beginning of the episode.
+    """
+
+    agent_view: chex.Array  # (num_obs_features,)
+    action_mask: chex.Array  # (num_actions,)
+    step_count: Optional[chex.Array] = None  # (,)
+
+
+class ObservationGlobalState(NamedTuple):
+    """The observation seen by agents in centralised systems.
+    Extends `Observation` by adding a `global_state` attribute for centralised training.
+    global_state: The global state of the environment, often a concatenation of agents' views.
+    """
+
+    agent_view: chex.Array
+    action_mask: chex.Array
+    global_state: chex.Array
+    step_count: chex.Array
+
+
+class EvalState(NamedTuple):
+    """State of the evaluator."""
+
+    key: chex.PRNGKey
+    env_state: State
+    timestep: TimeStep
+    step_count: chex.Array
+    episode_return: chex.Array
+
+
+class RNNEvalState(NamedTuple):
+    """State of the evaluator for recurrent architectures."""
+
+    key: chex.PRNGKey
+    env_state: State
+    timestep: TimeStep
+    dones: Done
+    hstate: HiddenState
+    step_count: chex.Array
+    episode_return: chex.Array
+
+
+class ActorCriticParams(NamedTuple):
+    """Parameters of an actor critic network."""
+
+    actor_params: FrozenDict
+    critic_params: FrozenDict
+
+
+class ActorCriticOptStates(NamedTuple):
+    """OptStates of actor critic learner."""
+
+    actor_opt_state: OptState
+    critic_opt_state: OptState
+
+
+class ActorCriticHiddenStates(NamedTuple):
+    """Hidden states for an actor critic learner."""
+
+    policy_hidden_state: HiddenState
+    critic_hidden_state: HiddenState
+
+
+class CoreLearnerState(NamedTuple):
+    """Base state of the learner. Can be used for both on-policy and off-policy learners.
+    Mainly used for sebulba systems since we dont store env state."""
+
+    params: Parameters
+    opt_states: OptStates
+    key: chex.PRNGKey
+
+
+class OnPolicyLearnerState(NamedTuple):
+    """State of the learner. Used for on-policy learners."""
+
+    params: Parameters
+    opt_states: OptStates
+    key: chex.PRNGKey
+    env_state: WrapperState
+    timestep: TimeStep
+
+
+class RNNLearnerState(NamedTuple):
+    """State of the `Learner` for recurrent architectures."""
+
+    params: Parameters
+    opt_states: OptStates
+    key: chex.PRNGKey
+    env_state: WrapperState
+    timestep: TimeStep
+    done: Done
+    truncated: Truncated
+    hstates: HiddenStates
+
+
+class OffPolicyLearnerState(NamedTuple):
+    params: Parameters
+    opt_states: OptStates
+    buffer_state: BufferState
+    key: chex.PRNGKey
+    env_state: WrapperState
+    timestep: TimeStep
+
+
+class RNNOffPolicyLearnerState(NamedTuple):
+    params: Parameters
+    opt_states: OptStates
+    buffer_state: BufferState
+    key: chex.PRNGKey
+    env_state: WrapperState
+    timestep: TimeStep
+    dones: Done
+    truncated: Truncated
+    hstates: HiddenStates
+
+
+class OnlineAndTarget(NamedTuple):
+    online: FrozenDict
+    target: FrozenDict
+
+
+StoixState = TypeVar(
+    "StoixState",
+)
+StoixTransition = TypeVar(
+    "StoixTransition",
+)
+
+
+class SebulbaExperimentOutput(NamedTuple, Generic[StoixState]):
+    """Experiment output."""
+
+    learner_state: StoixState
+    train_metrics: Dict[str, chex.Array]
+
+
+class AnakinExperimentOutput(NamedTuple, Generic[StoixState]):
+    """Experiment output."""
+
+    learner_state: StoixState
+    episode_metrics: Dict[str, chex.Array]
+    train_metrics: Dict[str, chex.Array]
+
+
+class EvaluationOutput(NamedTuple, Generic[StoixState]):
+    """Evaluation output."""
+
+    learner_state: StoixState
+    episode_metrics: Dict[str, chex.Array]
+
+
+RNNObservation: TypeAlias = Tuple[Observation, Done]
+LearnerFn = Callable[[StoixState], AnakinExperimentOutput[StoixState]]
+SebulbaLearnerFn = Callable[
+    [StoixState, List[StoixTransition]], SebulbaExperimentOutput[StoixState]
+]
+SebulbaEvalFn = Callable[[FrozenDict, chex.PRNGKey], Dict[str, chex.Array]]
+
+ActorApply = Callable[..., DistributionLike]
+
+ActFn = Callable[[FrozenDict, Observation, chex.PRNGKey], chex.Array]
+CriticApply = Callable[[FrozenDict, Observation], Value]
+DistributionCriticApply = Callable[[FrozenDict, Observation], DistributionLike]
+ContinuousQApply = Callable[[FrozenDict, Observation, Action], Value]
+ActorCriticApply = Callable[[FrozenDict, Observation], Tuple[DistributionLike, Value]]
+RecActorApply = Callable[
+    [FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, DistributionLike]
+]
+RecActFn = Callable[
+    [FrozenDict, HiddenState, RNNObservation, chex.PRNGKey], Tuple[HiddenState, chex.Array]
+]
+RecCriticApply = Callable[[FrozenDict, HiddenState, RNNObservation], Tuple[HiddenState, Value]]
+
+
+@runtime_checkable
+class EvalFn(Protocol[StoixState]):
+    """Evaluator function protocol that allows for optional running_statistics parameter."""
+
+    def __call__(
+        self,
+        trained_params: FrozenDict,
+        key: chex.PRNGKey,
+        running_statistics: Optional[RunningStatisticsState] = None,
+    ) -> EvaluationOutput[StoixState]:
+        ...
+</file>
+
+</files>
