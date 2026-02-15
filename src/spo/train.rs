@@ -1,6 +1,6 @@
 use std::any::Any;
 use anyhow::{bail, Result};
-use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
+use burn::module::{Module, ModuleMapper, ModuleVisitor, ParamId};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::Backend;
@@ -179,10 +179,10 @@ struct FloatTensorCollector {
 }
 
 impl<B: Backend> ModuleVisitor<B> for FloatTensorCollector {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+    fn visit_float<const D: usize>(&mut self, _id: ParamId, tensor: &Tensor<B, D>) {
         // Keep tensors on device and preserve typed shape information.
         // This avoids host TensorData materialization during target-network updates.
-        self.tensors.push(Box::new(param.val()));
+        self.tensors.push(Box::new(tensor.clone()));
     }
 }
 
@@ -192,8 +192,7 @@ struct SoftUpdateMapper {
 }
 
 impl<B: Backend> ModuleMapper<B> for SoftUpdateMapper {
-    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
-        let (id, target_tensor, mapper) = param.consume();
+    fn map_float<const D: usize>(&mut self, _id: ParamId, target_tensor: Tensor<B, D>) -> Tensor<B, D> {
         let online_any = self
             .online_tensors
             .pop_front()
@@ -201,9 +200,8 @@ impl<B: Backend> ModuleMapper<B> for SoftUpdateMapper {
         let online_tensor = *online_any
             .downcast::<Tensor<B, D>>()
             .expect("online parameter type mismatch during soft update");
-        let blended = target_tensor.mul_scalar((1.0 - self.tau) as f32)
-            + online_tensor.mul_scalar(self.tau as f32);
-        Param::from_mapped_value(id, blended, mapper)
+        target_tensor.mul_scalar((1.0 - self.tau) as f32)
+            + online_tensor.mul_scalar(self.tau as f32)
     }
 }
 
@@ -489,12 +487,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         .clone()
                         .to_data()
                         .to_vec::<f32>()
-                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_tm1: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_tm1: {e:?}"))?;
                     let target_v_t_vec = target_v_t
                         .detach()
                         .to_data()
                         .to_vec::<f32>()
-                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_t: {e}"))?;
+                        .map_err(|e| anyhow::anyhow!("failed to convert target_v_t: {e:?}"))?;
 
                     let mut target_values = vec![0.0f32; batch];
                     let sequence_len = args.sample_sequence_length;

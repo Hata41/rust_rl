@@ -1,6 +1,7 @@
 use burn::tensor::activation::{log_softmax, softmax};
-use burn::tensor::{Distribution, Tensor};
+use burn::tensor::Tensor;
 use burn::tensor::Int;
+use rand::Rng;
 
 pub fn masked_logits<Bk: burn::tensor::backend::Backend>(
     logits: Tensor<Bk, 2>,
@@ -36,16 +37,31 @@ pub fn sample_actions_categorical<Bk: burn::tensor::backend::Backend>(
 ) -> Tensor<Bk, 1, Int> {
     let masked = masked_logits(logits, mask_f32);
     let probs = softmax(masked, 1);
-    let [batch_size, _action_dim] = probs.dims();
+    let [batch_size, action_dim] = probs.dims();
 
-    let u = Tensor::<Bk, 2>::random(
-        [batch_size, 1],
-        Distribution::Uniform(1.0e-6, 1.0 - 1.0e-6),
-        device,
-    );
-    let cdf = probs.cumsum(1);
+    let probs_vec = probs
+        .to_data()
+        .to_vec::<f32>()
+        .expect("failed to materialize probability tensor for categorical sampling");
 
-    cdf.lower(u).int().sum_dim(1).reshape([batch_size])
+    let mut rng = rand::thread_rng();
+    let mut actions = vec![0i64; batch_size];
+    for b in 0..batch_size {
+        let row = &probs_vec[b * action_dim..(b + 1) * action_dim];
+        let u: f32 = rng.gen_range(1.0e-6..(1.0 - 1.0e-6));
+        let mut cumulative = 0.0f32;
+        let mut selected = action_dim.saturating_sub(1) as i64;
+        for (idx, p) in row.iter().enumerate() {
+            cumulative += *p;
+            if u <= cumulative {
+                selected = idx as i64;
+                break;
+            }
+        }
+        actions[b] = selected;
+    }
+
+    Tensor::<Bk, 1, Int>::from_data(burn::tensor::TensorData::new(actions, [batch_size]), device)
 }
 
 pub struct PpoLossParts<Bk: burn::tensor::backend::Backend> {

@@ -233,7 +233,7 @@ pub fn run_smc_search<B: Backend>(
         let current_values = current_values_t
             .to_data()
             .to_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("failed to convert current values: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to convert current values: {e:?}"))?;
 
         let logits = agent.actor_logits(actor_input);
         // Burn's TensorData constructor takes ownership; cloning here keeps the reusable
@@ -248,7 +248,7 @@ pub fn run_smc_search<B: Backend>(
             Ok(v) => v,
             Err(_) => actions_data
                 .to_vec::<i64>()
-                .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e}"))?
+                .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e:?}"))?
                 .into_iter()
                 .map(|v| v as i32)
                 .collect(),
@@ -272,7 +272,7 @@ pub fn run_smc_search<B: Backend>(
         let next_values = next_values_t
             .to_data()
             .to_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("failed to convert next values: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to convert next values: {e:?}"))?;
 
         for i in 0..steps.len() {
             let td_error = steps[i].reward + next_values[i] - current_values[i];

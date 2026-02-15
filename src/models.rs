@@ -1,5 +1,5 @@
 use burn::module::Module;
-use burn::nn::attention::{CrossAttention, CrossAttentionConfig, MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
+use burn::nn::attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Tensor};
@@ -27,8 +27,8 @@ impl<Bk: burn::tensor::backend::Backend> Mlp<Bk> {
 pub struct TransformerBlock<Bk: burn::tensor::backend::Backend> {
     ems_self_attn: MultiHeadAttention<Bk>,
     item_self_attn: MultiHeadAttention<Bk>,
-    ems_to_item_attn: CrossAttention<Bk>,
-    item_to_ems_attn: CrossAttention<Bk>,
+    ems_to_item_attn: MultiHeadAttention<Bk>,
+    item_to_ems_attn: MultiHeadAttention<Bk>,
     ems_ff1: Linear<Bk>,
     ems_ff2: Linear<Bk>,
     item_ff1: Linear<Bk>,
@@ -44,11 +44,10 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
             .with_dropout(dropout)
             .init(device);
 
-        let head_dim = (embed_dim / num_heads).max(1);
-        let ems_to_item_attn = CrossAttentionConfig::new(embed_dim, embed_dim, num_heads, num_heads, head_dim)
+        let ems_to_item_attn = MultiHeadAttentionConfig::new(embed_dim, num_heads)
             .with_dropout(dropout)
             .init(device);
-        let item_to_ems_attn = CrossAttentionConfig::new(embed_dim, embed_dim, num_heads, num_heads, head_dim)
+        let item_to_ems_attn = MultiHeadAttentionConfig::new(embed_dim, num_heads)
             .with_dropout(dropout)
             .init(device);
 
@@ -91,10 +90,12 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
 
         let ems_cross = self
             .ems_to_item_attn
-            .forward(ems.clone(), items.clone(), Some(items_pad_mask));
+            .forward(MhaInput::new(ems.clone(), items.clone(), items.clone()).mask_pad(items_pad_mask))
+            .context;
         let items_cross = self
             .item_to_ems_attn
-            .forward(items.clone(), ems.clone(), Some(ems_pad_mask));
+            .forward(MhaInput::new(items.clone(), ems.clone(), ems.clone()).mask_pad(ems_pad_mask))
+            .context;
 
         let ems = ems + ems_cross;
         let items = items + items_cross;

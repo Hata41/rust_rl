@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use burn::module::{Module, ModuleVisitor, Param};
+use burn::module::{Module, ModuleVisitor, ParamId};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::{ElementConversion, Tensor, TensorData};
@@ -43,8 +43,8 @@ impl<'a> GradSqAccumulator<'a> {
 }
 
 impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(param.id) {
+    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<Bk, D>) {
+        if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(id) {
             if let Ok(values) = grad.to_data().to_vec::<Bk::FloatElem>() {
                 self.sum_sq += values
                     .iter()
@@ -64,10 +64,10 @@ struct GradScaler<'a> {
 }
 
 impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradScaler<'_> {
-    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
-        if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(param.id) {
+    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<Bk, D>) {
+        if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(id) {
             self.grads
-                .register::<Bk::InnerBackend, D>(param.id, grad.mul_scalar(self.scale));
+                .register::<Bk::InnerBackend, D>(id, grad.mul_scalar(self.scale));
         }
     }
 }
@@ -185,7 +185,7 @@ fn run_deterministic_eval<B: AutodiffBackend>(
             Ok(v) => v,
             Err(_) => actions_data
                 .to_vec::<i64>()
-                .map_err(|e| anyhow::anyhow!("failed to convert greedy actions: {e}"))?
+                .map_err(|e| anyhow::anyhow!("failed to convert greedy actions: {e:?}"))?
                 .into_iter()
                 .map(|v| v as i32)
                 .collect(),
@@ -259,7 +259,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         );
     }
 
-    B::seed(&device, args.seed);
+    B::seed(args.seed);
 
     let model_probe = make_env(&args.task_id, &args, args.seed)?;
     let model_kind = detect_env_model_from_metadata(&*model_probe);
@@ -416,7 +416,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     Ok(v) => v,
                     Err(_) => actions_data
                         .to_vec::<i64>()
-                        .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e}"))?
+                        .map_err(|e| anyhow::anyhow!("failed to convert sampled actions: {e:?}"))?
                         .into_iter()
                         .map(|v| v as i32)
                         .collect(),
