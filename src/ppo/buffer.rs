@@ -242,6 +242,32 @@ impl Rollout {
         t * self.n + env
     }
 
+    pub fn assert_preallocated(&self) {
+        let num_samples = self.t * self.n;
+
+        debug_assert_eq!(self.actions.len(), num_samples);
+        debug_assert_eq!(self.old_logp.len(), num_samples);
+        debug_assert_eq!(self.values.len(), num_samples);
+        debug_assert_eq!(self.rewards.len(), num_samples);
+        debug_assert_eq!(self.dones.len(), num_samples);
+        debug_assert_eq!(self.advantages.len(), num_samples);
+        debug_assert_eq!(self.targets.len(), num_samples);
+
+        if self.is_binpack {
+            debug_assert_eq!(self.obs.len(), 0);
+            debug_assert_eq!(self.items.len(), num_samples * self.max_items * 3);
+            debug_assert_eq!(self.ems.len(), num_samples * self.max_ems * 6);
+            debug_assert_eq!(self.items_valid.len(), num_samples * self.max_items);
+            debug_assert_eq!(self.ems_valid.len(), num_samples * self.max_ems);
+        } else {
+            debug_assert_eq!(self.obs.len(), num_samples * self.obs_dim);
+            debug_assert_eq!(self.items.len(), 0);
+            debug_assert_eq!(self.ems.len(), 0);
+            debug_assert_eq!(self.items_valid.len(), 0);
+            debug_assert_eq!(self.ems_valid.len(), 0);
+        }
+    }
+
     pub fn store_step(
         &mut self,
         t: usize,

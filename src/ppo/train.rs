@@ -16,7 +16,7 @@ use rustpool::core::types::GenericObs;
 
 use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
-use crate::models::{Actor, Agent, Critic};
+use crate::models::{Actor, ActorInput, Agent, Critic, CriticInput, PolicyInput};
 use crate::ppo::buffer::{flatten_obs, parse_binpack_obs, Rollout};
 use crate::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
@@ -233,8 +233,12 @@ fn run_deterministic_eval<B: AutodiffBackend>(
                 build_binpack_batch_tensors::<B>(&cur_obs, max_items, max_ems, device)?;
 
             agent
-                .actor
-                .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t)
+                .actor_logits(ActorInput::BinPack {
+                    ems: ems_t,
+                    items: items_t,
+                    ems_pad_mask: ems_pad_t,
+                    items_pad_mask: items_pad_t,
+                })
                 .detach()
         } else {
             let mut obs_flat_all = vec![0.0f32; num_eval_envs * obs_dim];
@@ -247,7 +251,9 @@ fn run_deterministic_eval<B: AutodiffBackend>(
                 TensorData::new(obs_flat_all, [num_eval_envs, obs_dim]),
                 device,
             );
-            agent.actor.forward(obs_t).detach()
+            agent
+                .actor_logits(ActorInput::Dense { obs: obs_t })
+                .detach()
         };
 
         let masked = masked_logits(logits, mask_t);
@@ -442,6 +448,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         } else {
             Rollout::new(args.rollout_length, local_num_envs, obs_dim, action_dim)
         };
+        roll.assert_preallocated();
         let mut obs_flat_all = if is_binpack {
             Vec::new()
         } else {
@@ -476,15 +483,15 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
                         build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
 
-                    let logits = agent
-                        .actor
-                        .forward_binpack(ems_t.clone(), items_t.clone(), ems_pad_t.clone(), items_pad_t.clone())
-                        .detach();
-                    let values2 = agent
-                        .critic
-                        .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t)
-                        .detach();
-                    (logits, values2)
+                    let (logits, values2) = agent.policy_value(PolicyInput::BinPack {
+                        ems: ems_t,
+                        items: items_t,
+                        ems_pad_mask: ems_pad_t,
+                        items_pad_mask: items_pad_t,
+                        ems_valid_f32: ems_valid_t,
+                        items_valid_f32: items_valid_t,
+                    });
+                    (logits.detach(), values2.detach())
                 } else {
                     for e in 0..local_num_envs {
                         let flat = flatten_obs(&cur_obs[e]);
@@ -496,9 +503,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         &device,
                     );
 
-                    let logits = agent.actor.forward(obs_t.clone()).detach();
-                    let values2 = agent.critic.forward(obs_t).detach();
-                    (logits, values2)
+                    let (logits, values2) =
+                        agent.policy_value(PolicyInput::Dense { obs: obs_t });
+                    (logits.detach(), values2.detach())
                 };
                 let values = values2.reshape([local_num_envs]);
 
@@ -586,15 +593,23 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let (items_t, ems_t, items_pad_t, ems_pad_t, items_valid_t, ems_valid_t) =
                 build_binpack_batch_tensors::<B>(&cur_obs, args.max_items, args.max_ems, &device)?;
             agent
-                .critic
-                .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t)
+                .critic_values(CriticInput::BinPack {
+                    ems: ems_t,
+                    items: items_t,
+                    ems_pad_mask: ems_pad_t,
+                    items_pad_mask: items_pad_t,
+                    ems_valid_f32: ems_valid_t,
+                    items_valid_f32: items_valid_t,
+                })
                 .detach()
         } else {
             let obs_last = Tensor::<B, 2>::from_data(
                 TensorData::new(obs_flat_all, [local_num_envs, obs_dim]),
                 &device,
             );
-            agent.critic.forward(obs_last).detach()
+            agent
+                .critic_values(CriticInput::Dense { obs: obs_last })
+                .detach()
         };
         let last_v = last_v2.reshape([local_num_envs]);
         let last_values: Vec<f32> = last_v.to_data().to_vec().unwrap();
@@ -691,12 +706,14 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             &device,
                         );
 
-                        let logits = agent
-                            .actor
-                            .forward_binpack(ems_t.clone(), items_t.clone(), ems_pad_t.clone(), items_pad_t.clone());
-                        let v2 = agent
-                            .critic
-                            .forward_binpack(ems_t, items_t, ems_pad_t, items_pad_t, ems_valid_t, items_valid_t);
+                        let (logits, v2) = agent.policy_value(PolicyInput::BinPack {
+                            ems: ems_t,
+                            items: items_t,
+                            ems_pad_mask: ems_pad_t,
+                            items_pad_mask: items_pad_t,
+                            ems_valid_f32: ems_valid_t,
+                            items_valid_f32: items_valid_t,
+                        });
 
                         let act_t = Tensor::<B, 1, Int>::from_data(
                             TensorData::new(act_mb, [mb_size]),
@@ -757,8 +774,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             &device,
                         );
 
-                        let logits = agent.actor.forward(obs_t.clone());
-                        let v2 = agent.critic.forward(obs_t);
+                        let (logits, v2) = agent.policy_value(PolicyInput::Dense { obs: obs_t });
 
                         (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
                     };

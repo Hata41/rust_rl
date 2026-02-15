@@ -1,6 +1,7 @@
 use burn::module::Module;
 use burn::nn::attention::{CrossAttention, CrossAttentionConfig, MhaInput, MultiHeadAttention, MultiHeadAttentionConfig};
 use burn::nn::{Linear, LinearConfig};
+use burn::tensor::backend::Backend;
 use burn::tensor::{Bool, Tensor};
 
 #[derive(Module, Clone, Debug)]
@@ -269,6 +270,18 @@ impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
     ) -> Tensor<Bk, 2> {
         self.binpack.forward(ems, items, ems_pad_mask, items_pad_mask)
     }
+
+    pub fn forward_input(&self, input: ActorInput<Bk>) -> Tensor<Bk, 2> {
+        match input {
+            ActorInput::Dense { obs } => self.forward(obs),
+            ActorInput::BinPack {
+                ems,
+                items,
+                ems_pad_mask,
+                items_pad_mask,
+            } => self.forward_binpack(ems, items, ems_pad_mask, items_pad_mask),
+        }
+    }
 }
 
 #[derive(Module, Clone, Debug)]
@@ -309,6 +322,67 @@ impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
             items_valid_f32,
         )
     }
+
+    pub fn forward_input(&self, input: CriticInput<Bk>) -> Tensor<Bk, 2> {
+        match input {
+            CriticInput::Dense { obs } => self.forward(obs),
+            CriticInput::BinPack {
+                ems,
+                items,
+                ems_pad_mask,
+                items_pad_mask,
+                ems_valid_f32,
+                items_valid_f32,
+            } => self.forward_binpack(
+                ems,
+                items,
+                ems_pad_mask,
+                items_pad_mask,
+                ems_valid_f32,
+                items_valid_f32,
+            ),
+        }
+    }
+}
+
+pub enum ActorInput<Bk: Backend> {
+    Dense {
+        obs: Tensor<Bk, 2>,
+    },
+    BinPack {
+        ems: Tensor<Bk, 3>,
+        items: Tensor<Bk, 3>,
+        ems_pad_mask: Tensor<Bk, 2, Bool>,
+        items_pad_mask: Tensor<Bk, 2, Bool>,
+    },
+}
+
+pub enum CriticInput<Bk: Backend> {
+    Dense {
+        obs: Tensor<Bk, 2>,
+    },
+    BinPack {
+        ems: Tensor<Bk, 3>,
+        items: Tensor<Bk, 3>,
+        ems_pad_mask: Tensor<Bk, 2, Bool>,
+        items_pad_mask: Tensor<Bk, 2, Bool>,
+        ems_valid_f32: Tensor<Bk, 2>,
+        items_valid_f32: Tensor<Bk, 2>,
+    },
+}
+
+pub enum PolicyInput<Bk: Backend> {
+    Dense {
+        obs: Tensor<Bk, 2>,
+    },
+    BinPack {
+        ems: Tensor<Bk, 3>,
+        items: Tensor<Bk, 3>,
+        ems_pad_mask: Tensor<Bk, 2, Bool>,
+        items_pad_mask: Tensor<Bk, 2, Bool>,
+        ems_valid_f32: Tensor<Bk, 2>,
+        items_valid_f32: Tensor<Bk, 2>,
+    },
 }
 
 #[derive(Module, Clone, Debug)]
@@ -323,5 +397,47 @@ impl<Bk: burn::tensor::backend::Backend> Agent<Bk> {
             actor: Actor::new(obs_dim, hidden, action_dim, device),
             critic: Critic::new(obs_dim, hidden, device),
         }
+    }
+
+    pub fn policy_value(&self, input: PolicyInput<Bk>) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
+        match input {
+            PolicyInput::Dense { obs } => {
+                let logits = self.actor.forward_input(ActorInput::Dense { obs: obs.clone() });
+                let values = self.critic.forward_input(CriticInput::Dense { obs });
+                (logits, values)
+            }
+            PolicyInput::BinPack {
+                ems,
+                items,
+                ems_pad_mask,
+                items_pad_mask,
+                ems_valid_f32,
+                items_valid_f32,
+            } => {
+                let logits = self.actor.forward_input(ActorInput::BinPack {
+                    ems: ems.clone(),
+                    items: items.clone(),
+                    ems_pad_mask: ems_pad_mask.clone(),
+                    items_pad_mask: items_pad_mask.clone(),
+                });
+                let values = self.critic.forward_input(CriticInput::BinPack {
+                    ems,
+                    items,
+                    ems_pad_mask,
+                    items_pad_mask,
+                    ems_valid_f32,
+                    items_valid_f32,
+                });
+                (logits, values)
+            }
+        }
+    }
+
+    pub fn actor_logits(&self, input: ActorInput<Bk>) -> Tensor<Bk, 2> {
+        self.actor.forward_input(input)
+    }
+
+    pub fn critic_values(&self, input: CriticInput<Bk>) -> Tensor<Bk, 2> {
+        self.critic.forward_input(input)
     }
 }

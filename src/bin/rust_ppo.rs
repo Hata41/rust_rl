@@ -3,6 +3,7 @@ use burn::backend::autodiff::Autodiff;
 use burn::backend::cuda::{Cuda, CudaDevice};
 use burn::collective::{register, CollectiveConfig, PeerId};
 use burn_ndarray::{NdArray, NdArrayDevice};
+use std::collections::HashMap;
 use std::fmt;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -64,10 +65,58 @@ impl Visit for DashboardVisitor {
     }
 }
 
-#[derive(Default)]
-struct DashboardFormatter;
+#[derive(Default, Clone)]
+struct MetricRegistry {
+    labels: HashMap<String, String>,
+}
+
+impl MetricRegistry {
+    fn with_defaults() -> Self {
+        let mut registry = Self::default();
+        registry.register("global_grad_norm", "Grad norm");
+        registry.register("steps_per_second", "Steps per second");
+        registry.register("learning_rate", "Learning rate");
+        registry.register("critic_loss", "Critic loss");
+        registry.register("episode_length_mean", "Episode length mean");
+        registry.register("episode_length_max", "Episode length max");
+        registry.register("episode_length_min", "Episode length min");
+        registry
+    }
+
+    fn with_env_overrides(mut self) -> Self {
+        if let Ok(raw) = std::env::var("RUST_PPO_METRIC_LABELS") {
+            for entry in raw.split(',') {
+                let Some((key, label)) = entry.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim();
+                let label = label.trim();
+                if !key.is_empty() && !label.is_empty() {
+                    self.register(key, label);
+                }
+            }
+        }
+        self
+    }
+
+    fn register(&mut self, key: impl Into<String>, label: impl Into<String>) {
+        self.labels.insert(key.into(), label.into());
+    }
+
+    fn resolve(&self, key: &str) -> Option<&str> {
+        self.labels.get(key).map(String::as_str)
+    }
+}
+
+struct DashboardFormatter {
+    registry: MetricRegistry,
+}
 
 impl DashboardFormatter {
+    fn new(registry: MetricRegistry) -> Self {
+        Self { registry }
+    }
+
     fn category_label(raw: Option<&str>) -> &'static str {
         match raw.unwrap_or("MISC").to_ascii_uppercase().as_str() {
             "TRAINER" | "TRAIN" => "TRAINER",
@@ -90,16 +139,9 @@ impl DashboardFormatter {
         format!("{code}{label}\x1b[0m")
     }
 
-    fn pretty_key(key: &str) -> String {
-        match key {
-            "global_grad_norm" => return "Grad norm".to_string(),
-            "steps_per_second" => return "Steps per second".to_string(),
-            "learning_rate" => return "Learning rate".to_string(),
-            "critic_loss" => return "Critic loss".to_string(),
-            "episode_length_mean" => return "Episode length mean".to_string(),
-            "episode_length_max" => return "Episode length max".to_string(),
-            "episode_length_min" => return "Episode length min".to_string(),
-            _ => {}
+    fn pretty_key(&self, key: &str) -> String {
+        if let Some(label) = self.registry.resolve(key) {
+            return label.to_string();
         }
 
         let mut chars = key.replace('_', " ").chars().collect::<Vec<_>>();
@@ -134,7 +176,7 @@ where
                 write!(writer, " | ")?;
             }
             wrote_metric = true;
-            write!(writer, "{}: {}", Self::pretty_key(&key), value)?;
+            write!(writer, "{}: {}", self.pretty_key(&key), value)?;
         }
 
         if !wrote_metric {
@@ -150,6 +192,9 @@ fn main() -> Result<()> {
     let dist = DistInfo::from_env_or_args(&args)?;
 
     if dist.rank == 0 {
+        let formatter = DashboardFormatter::new(
+            MetricRegistry::with_defaults().with_env_overrides(),
+        );
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
         let _ = tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -160,7 +205,7 @@ fn main() -> Result<()> {
             .with_line_number(false)
             .with_thread_ids(false)
             .with_thread_names(false)
-            .event_format(DashboardFormatter)
+                .event_format(formatter)
             .try_init();
     }
 
