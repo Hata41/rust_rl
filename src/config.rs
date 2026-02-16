@@ -417,7 +417,10 @@ impl Args {
         set_if_some!(ent_coef, file.optimization.ent_coef);
         set_if_some!(vf_coef, file.optimization.vf_coef);
         set_if_some!(decay_learning_rates, file.optimization.decay_learning_rates);
-        set_if_some!(standardize_advantages, file.optimization.standardize_advantages);
+        set_if_some!(
+            standardize_advantages,
+            file.optimization.standardize_advantages
+        );
         set_if_some!(reward_scale, file.optimization.reward_scale);
         set_if_some!(tau, file.optimization.tau);
 
@@ -443,8 +446,14 @@ impl Args {
         set_if_some!(init_log_alpha, file.spo.init_log_alpha);
         set_if_some!(search_gamma, file.spo.search_gamma);
         set_if_some!(search_gae_lambda, file.spo.search_gae_lambda);
-        set_if_some!(root_exploration_dirichlet_alpha, file.spo.root_exploration_dirichlet_alpha);
-        set_if_some!(root_exploration_dirichlet_fraction, file.spo.root_exploration_dirichlet_fraction);
+        set_if_some!(
+            root_exploration_dirichlet_alpha,
+            file.spo.root_exploration_dirichlet_alpha
+        );
+        set_if_some!(
+            root_exploration_dirichlet_fraction,
+            file.spo.root_exploration_dirichlet_fraction
+        );
         set_if_some!(resampling_period, file.spo.resampling_period);
         set_if_some!(resampling_ess_threshold, file.spo.resampling_ess_threshold);
         set_if_some!(adaptive_temperature, file.spo.adaptive_temperature);
@@ -506,8 +515,14 @@ impl Args {
         set_if_cli!(init_log_alpha, "init_log_alpha");
         set_if_cli!(search_gamma, "search_gamma");
         set_if_cli!(search_gae_lambda, "search_gae_lambda");
-        set_if_cli!(root_exploration_dirichlet_alpha, "root_exploration_dirichlet_alpha");
-        set_if_cli!(root_exploration_dirichlet_fraction, "root_exploration_dirichlet_fraction");
+        set_if_cli!(
+            root_exploration_dirichlet_alpha,
+            "root_exploration_dirichlet_alpha"
+        );
+        set_if_cli!(
+            root_exploration_dirichlet_fraction,
+            "root_exploration_dirichlet_fraction"
+        );
         set_if_cli!(resampling_period, "resampling_period");
         set_if_cli!(resampling_ess_threshold, "resampling_ess_threshold");
         set_if_cli!(adaptive_temperature, "adaptive_temperature");

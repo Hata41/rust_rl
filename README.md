@@ -123,6 +123,34 @@ Code pointers:
 
 For details, see [Configuration](docs/configuration.md), [PPO Training Loop](docs/training-loop.md), and [SPO Training Loop](docs/spo-training-loop.md).
 
+## CUDA backend selection and fallback
+
+- `hardware.device_type: cuda` (or `--device-type cuda`) now uses a startup probe before training starts.
+- Probe checks include CUDA driver visibility, requested device availability, context initialization, and NVRTC usability.
+- If probe succeeds, training runs on CUDA as requested.
+- If probe fails, the process does **not** panic: it logs a warning with the failure category and automatically falls back to CPU.
+
+Failure categories reported in logs:
+
+- `no-gpu`: no visible CUDA devices, or requested device index is out of range.
+- `driver-only-no-toolkit`: driver is present but toolkit/NVRTC is not usable.
+- `missing-nvrtc`: toolkit hints exist but NVRTC runtime library cannot be loaded.
+- `unsupported-cuda-version`: driver/toolkit/version mismatch.
+- `init-failure`: other CUDA initialization failures.
+
+Useful environment variables on GPU hosts:
+
+- `CUDA_PATH` or `CUDA_HOME`: points to CUDA toolkit root.
+- `LD_LIBRARY_PATH`: must include paths containing `libcuda.so` (driver runtime) and `libnvrtc.so` (toolkit runtime).
+
+Example (GPU host):
+
+```bash
+export CUDA_PATH=/usr/local/cuda
+export LD_LIBRARY_PATH="$CUDA_PATH/lib64:$LD_LIBRARY_PATH"
+cargo run --release --bin ppo -- --config ppo_config.yaml --device-type cuda
+```
+
 ## Recent updates
 
 Recent implementation and documentation changes are now reflected across PPO and SPO paths.

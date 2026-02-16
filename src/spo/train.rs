@@ -1,11 +1,11 @@
-use std::any::Any;
 use anyhow::{bail, Result};
-use burn::module::{Module, ModuleMapper, ModuleVisitor, ParamId};
+use burn::module::{Module, ModuleMapper, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 use rand::{rngs::StdRng, SeedableRng};
+use std::any::Any;
 use std::collections::VecDeque;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -40,7 +40,11 @@ fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
     1.0 - progress
 }
 
-fn greedy_actions_from_weights(root_action_weights: &[f32], batch: usize, action_dim: usize) -> Vec<i32> {
+fn greedy_actions_from_weights(
+    root_action_weights: &[f32],
+    batch: usize,
+    action_dim: usize,
+) -> Vec<i32> {
     let mut actions = vec![0i32; batch];
     for env_idx in 0..batch {
         let row0 = env_idx * action_dim;
@@ -179,10 +183,10 @@ struct FloatTensorCollector {
 }
 
 impl<B: Backend> ModuleVisitor<B> for FloatTensorCollector {
-    fn visit_float<const D: usize>(&mut self, _id: ParamId, tensor: &Tensor<B, D>) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
         // Keep tensors on device and preserve typed shape information.
         // This avoids host TensorData materialization during target-network updates.
-        self.tensors.push(Box::new(tensor.clone()));
+        self.tensors.push(Box::new(param.val()));
     }
 }
 
@@ -192,7 +196,8 @@ struct SoftUpdateMapper {
 }
 
 impl<B: Backend> ModuleMapper<B> for SoftUpdateMapper {
-    fn map_float<const D: usize>(&mut self, _id: ParamId, target_tensor: Tensor<B, D>) -> Tensor<B, D> {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        let (id, target_tensor, mapper) = param.consume();
         let online_any = self
             .online_tensors
             .pop_front()
@@ -200,8 +205,9 @@ impl<B: Backend> ModuleMapper<B> for SoftUpdateMapper {
         let online_tensor = *online_any
             .downcast::<Tensor<B, D>>()
             .expect("online parameter type mismatch during soft update");
-        target_tensor.mul_scalar((1.0 - self.tau) as f32)
-            + online_tensor.mul_scalar(self.tau as f32)
+        let mixed = target_tensor.mul_scalar((1.0 - self.tau) as f32)
+            + online_tensor.mul_scalar(self.tau as f32);
+        Param::from_mapped_value(id, mixed, mapper)
     }
 }
 
@@ -213,7 +219,9 @@ where
     // Device-resident soft update stream:
     // target <- (1 - tau) * target + tau * online
     // without host synchronization on parameter tensors.
-    let mut collector = FloatTensorCollector { tensors: Vec::new() };
+    let mut collector = FloatTensorCollector {
+        tensors: Vec::new(),
+    };
     <M as Module<B>>::visit(online, &mut collector);
 
     let mut mapper = SoftUpdateMapper {
@@ -240,11 +248,17 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
     })?;
     let is_lead = dist.rank == 0;
     let eval_pool = if is_lead && args.num_eval_envs > 0 && args.num_eval_episodes > 0 {
-        Some(AsyncEnvPool::new(args.num_eval_envs, args.seed ^ 0xA11CEu64, {
-            let task = args.task_id.clone();
-            let args_clone = args.clone();
-            move |seed| make_env(&task, &args_clone, seed).expect("failed to create eval environment")
-        })?)
+        Some(AsyncEnvPool::new(
+            args.num_eval_envs,
+            args.seed ^ 0xA11CEu64,
+            {
+                let task = args.task_id.clone();
+                let args_clone = args.clone();
+                move |seed| {
+                    make_env(&task, &args_clone, seed).expect("failed to create eval environment")
+                }
+            },
+        )?)
     } else {
         None
     };
@@ -266,11 +280,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
     let mut agent_online = Agent::<B>::new(obs_dim, args.hidden_dim, action_dim, &device);
     let mut agent_target = agent_online.clone();
-    let mut duals = MpoDuals::<B>::new(
-        args.init_log_temperature,
-        args.init_log_alpha,
-        &device,
-    );
+    let mut duals = MpoDuals::<B>::new(args.init_log_temperature, args.init_log_alpha, &device);
     let mut actor_optim = AdamConfig::new().init::<B, crate::models::Actor<B>>();
     let mut critic_optim = AdamConfig::new().init::<B, crate::models::Critic<B>>();
     let mut dual_optim = AdamConfig::new().init::<B, MpoDuals<B>>();
@@ -448,10 +458,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         &device,
                     );
                     let sampled_advantages = Tensor::<B, 2>::from_data(
-                        TensorData::new(
-                            sampled.sampled_advantages,
-                            [batch, sampled.num_particles],
-                        ),
+                        TensorData::new(sampled.sampled_advantages, [batch, sampled.num_particles]),
                         &device,
                     );
 
@@ -532,21 +539,21 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                         &mut grads,
                         &agent_online.actor,
                     );
-                    let grads_critic =
-                        GradientsParams::from_module::<B, crate::models::Critic<B>>(
-                            &mut grads,
-                            &agent_online.critic,
-                        );
-                    let grads_duals = GradientsParams::from_module::<B, MpoDuals<B>>(&mut grads, &duals);
+                    let grads_critic = GradientsParams::from_module::<B, crate::models::Critic<B>>(
+                        &mut grads,
+                        &agent_online.critic,
+                    );
+                    let grads_duals =
+                        GradientsParams::from_module::<B, MpoDuals<B>>(&mut grads, &duals);
 
-                    agent_online.actor = actor_optim.step(current_actor_lr, agent_online.actor, grads_actor);
+                    agent_online.actor =
+                        actor_optim.step(current_actor_lr, agent_online.actor, grads_actor);
                     agent_online.critic =
                         critic_optim.step(current_critic_lr, agent_online.critic, grads_critic);
                     duals = dual_optim.step(args.dual_lr, duals, grads_duals);
 
                     soft_update_params::<Agent<B>, B>(&mut agent_target, &agent_online, args.tau);
-                    backward_step_duration_ms +=
-                        backward_started.elapsed().as_secs_f64() * 1_000.0;
+                    backward_step_duration_ms += backward_started.elapsed().as_secs_f64() * 1_000.0;
 
                     actor_loss_acc = actor_loss_acc + parts.actor_loss.detach();
                     critic_loss_acc = critic_loss_acc + parts.critic_loss.detach();
@@ -614,15 +621,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let min_return = if recent_returns.is_empty() {
                 0.0
             } else {
-                recent_returns
-                    .iter()
-                    .copied()
-                    .fold(f32::INFINITY, f32::min)
+                recent_returns.iter().copied().fold(f32::INFINITY, f32::min)
             };
             let mean_ep_len = if recent_lengths.is_empty() {
                 0.0
             } else {
-                recent_lengths.iter().map(|v| *v as f32).sum::<f32>() / (recent_lengths.len() as f32)
+                recent_lengths.iter().map(|v| *v as f32).sum::<f32>()
+                    / (recent_lengths.len() as f32)
             };
             let max_ep_len = recent_lengths.iter().copied().max().unwrap_or(0);
             let min_ep_len = recent_lengths.iter().copied().min().unwrap_or(0);

@@ -24,7 +24,7 @@ training_core:
   # Trajectory horizon T per environment per PPO update
   rollout_length: 20
   # Total PPO updates
-  num_updates: 100
+  num_updates: 2
   # PPO epochs over each collected rollout buffer
   epochs: 1
   # Number of minibatches per epoch

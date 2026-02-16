@@ -39,7 +39,12 @@ pub struct ReplayBuffer {
 }
 
 impl ReplayBuffer {
-    pub fn new(capacity: usize, add_batch_size: usize, action_dim: usize, num_particles: usize) -> Self {
+    pub fn new(
+        capacity: usize,
+        add_batch_size: usize,
+        action_dim: usize,
+        num_particles: usize,
+    ) -> Self {
         assert!(add_batch_size > 0, "add_batch_size must be > 0");
         assert!(num_particles > 0, "num_particles must be > 0");
         let max_length_time_axis = (capacity / add_batch_size).max(1);
@@ -279,7 +284,8 @@ impl ReplayBuffer {
                 root_action_weights
                     .extend_from_slice(&self.root_action_weights[m0..m0 + self.action_dim]);
                 let p0 = idx * self.num_particles;
-                sampled_actions.extend_from_slice(&self.sampled_actions[p0..p0 + self.num_particles]);
+                sampled_actions
+                    .extend_from_slice(&self.sampled_actions[p0..p0 + self.num_particles]);
                 sampled_advantages
                     .extend_from_slice(&self.sampled_advantages[p0..p0 + self.num_particles]);
             }

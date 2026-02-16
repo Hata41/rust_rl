@@ -1,9 +1,9 @@
 use anyhow::{bail, Result};
-use burn::module::{Module, ModuleVisitor, ParamId};
+use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::AutodiffBackend;
-use burn::tensor::{ElementConversion, Tensor, TensorData};
 use burn::tensor::Int;
+use burn::tensor::{ElementConversion, Tensor, TensorData};
 use rand::seq::SliceRandom;
 use rand::{rngs::StdRng, SeedableRng};
 use std::collections::VecDeque;
@@ -14,8 +14,8 @@ use crate::config::{Args, DistInfo};
 use crate::env::{make_env, AsyncEnvPool};
 use crate::env_model::{
     build_actor_input_batch, build_critic_input_batch, build_policy_input_batch,
-    build_policy_input_from_binpack_parts,
-    detect_env_model_from_metadata, infer_obs_dim, EnvModelKind,
+    build_policy_input_from_binpack_parts, detect_env_model_from_metadata, infer_obs_dim,
+    EnvModelKind,
 };
 use crate::models::{Actor, Agent, Critic, PolicyInput};
 use crate::ppo::buffer::{flatten_obs_into, Rollout};
@@ -43,7 +43,8 @@ impl<'a> GradSqAccumulator<'a> {
 }
 
 impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradSqAccumulator<'_> {
-    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<Bk, D>) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
+        let id = param.id;
         if let Some(grad) = self.grads.get::<Bk::InnerBackend, D>(id) {
             if let Ok(values) = grad.to_data().to_vec::<Bk::FloatElem>() {
                 self.sum_sq += values
@@ -64,7 +65,8 @@ struct GradScaler<'a> {
 }
 
 impl<Bk: AutodiffBackend> ModuleVisitor<Bk> for GradScaler<'_> {
-    fn visit_float<const D: usize>(&mut self, id: ParamId, _tensor: &Tensor<Bk, D>) {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<Bk, D>>) {
+        let id = param.id;
         if let Some(grad) = self.grads.remove::<Bk::InnerBackend, D>(id) {
             self.grads
                 .register::<Bk::InnerBackend, D>(id, grad.mul_scalar(self.scale));
@@ -79,7 +81,6 @@ fn clip_global_grad_norm<Bk: AutodiffBackend>(
     grads_critic: &mut GradientsParams,
     max_grad_norm: f32,
 ) -> f32 {
-
     let mut actor_acc = GradSqAccumulator::new(grads_actor);
     <Actor<Bk> as Module<Bk>>::visit(actor, &mut actor_acc);
 
@@ -161,18 +162,12 @@ fn run_deterministic_eval<B: AutodiffBackend>(
                 mask_f[row + a] = if cur_mask[e][a] { 1.0 } else { 0.0 };
             }
         }
-        let mask_t = Tensor::<B, 2>::from_data(
-            TensorData::new(mask_f, [num_eval_envs, action_dim]),
-            device,
-        );
+        let mask_t =
+            Tensor::<B, 2>::from_data(TensorData::new(mask_f, [num_eval_envs, action_dim]), device);
 
         let logits = agent
             .actor_logits(build_actor_input_batch::<B>(
-                &cur_obs,
-                model_kind,
-                args,
-                obs_dim,
-                device,
+                &cur_obs, model_kind, args, obs_dim, device,
             )?)
             .detach();
 
@@ -223,11 +218,7 @@ fn run_deterministic_eval<B: AutodiffBackend>(
         .iter()
         .copied()
         .fold(f32::INFINITY, f32::min);
-    let mean_ep_len = completed_lengths
-        .iter()
-        .map(|v| *v as f32)
-        .sum::<f32>()
-        / (episodes as f32);
+    let mean_ep_len = completed_lengths.iter().map(|v| *v as f32).sum::<f32>() / (episodes as f32);
     let max_ep_len = *completed_lengths.iter().max().unwrap_or(&0);
     let min_ep_len = *completed_lengths.iter().min().unwrap_or(&0);
 
@@ -259,7 +250,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         );
     }
 
-    B::seed(args.seed);
+    B::seed(&device, args.seed);
 
     let model_probe = make_env(&args.task_id, &args, args.seed)?;
     let model_kind = detect_env_model_from_metadata(&*model_probe);
@@ -396,16 +387,13 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
                 let rollout_model_started = Instant::now();
                 let (logits, values2) = agent.policy_value(build_policy_input_batch::<B>(
-                    &cur_obs,
-                    model_kind,
-                    &args,
-                    obs_dim,
-                    &device,
+                    &cur_obs, model_kind, &args, obs_dim, &device,
                 )?);
                 let (logits, values2) = (logits.detach(), values2.detach());
                 let values = values2.reshape([local_num_envs]);
 
-                let actions_t = sample_actions_categorical::<B>(logits.clone(), mask_t.clone(), &device);
+                let actions_t =
+                    sample_actions_categorical::<B>(logits.clone(), mask_t.clone(), &device);
 
                 let (logp_t, _ent_t) = logprob_and_entropy::<B>(logits, mask_t, actions_t.clone());
                 rollout_model_duration_ms +=
@@ -495,11 +483,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         let last_v2 = if is_binpack {
             agent
                 .critic_values(build_critic_input_batch::<B>(
-                    &cur_obs,
-                    model_kind,
-                    &args,
-                    obs_dim,
-                    &device,
+                    &cur_obs, model_kind, &args, obs_dim, &device,
                 )?)
                 .detach()
         } else {
@@ -555,7 +539,8 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     let mb_idx = &all_indices[start..end];
 
                     let data_prep_started = Instant::now();
-                    let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack {
+                    let (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2) = if is_binpack
+                    {
                         let (
                             items_mb,
                             ems_mb,
@@ -596,14 +581,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             TensorData::new(old_v_mb, [mb_size]),
                             &device,
                         );
-                        let adv_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(adv_mb, [mb_size]),
-                            &device,
-                        );
-                        let tgt_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(tgt_mb, [mb_size]),
-                            &device,
-                        );
+                        let adv_t =
+                            Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), &device);
+                        let tgt_t =
+                            Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), &device);
 
                         (logits, act_t, mask_t, old_lp_t, old_v_t, adv_t, tgt_t, v2)
                     } else {
@@ -630,14 +611,10 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                             TensorData::new(old_v_mb, [mb_size]),
                             &device,
                         );
-                        let adv_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(adv_mb, [mb_size]),
-                            &device,
-                        );
-                        let tgt_t = Tensor::<B, 1>::from_data(
-                            TensorData::new(tgt_mb, [mb_size]),
-                            &device,
-                        );
+                        let adv_t =
+                            Tensor::<B, 1>::from_data(TensorData::new(adv_mb, [mb_size]), &device);
+                        let tgt_t =
+                            Tensor::<B, 1>::from_data(TensorData::new(tgt_mb, [mb_size]), &device);
 
                         let (logits, v2) = agent.policy_value(PolicyInput::Dense { obs: obs_t });
 
@@ -780,18 +757,12 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let min_return = if recent_returns.is_empty() {
                 0.0
             } else {
-                recent_returns
-                    .iter()
-                    .copied()
-                    .fold(f32::INFINITY, f32::min)
+                recent_returns.iter().copied().fold(f32::INFINITY, f32::min)
             };
             let mean_ep_len = if recent_lengths.is_empty() {
                 0.0
             } else {
-                recent_lengths
-                    .iter()
-                    .map(|v| *v as f32)
-                    .sum::<f32>()
+                recent_lengths.iter().map(|v| *v as f32).sum::<f32>()
                     / (recent_lengths.len() as f32)
             };
             let max_ep_len = if recent_lengths.is_empty() {
@@ -808,8 +779,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
             let adv_stats = roll.advantage_stats();
 
             let rollout_steps = (args.rollout_length * args.num_envs) as f64;
-            let total_update_secs =
-                (rollout_elapsed + optimization_elapsed).as_secs_f64().max(1.0e-9);
+            let total_update_secs = (rollout_elapsed + optimization_elapsed)
+                .as_secs_f64()
+                .max(1.0e-9);
             let steps_per_second = rollout_steps / total_update_secs;
 
             let timesteps = (update + 1) * local_batch;

@@ -85,16 +85,13 @@ fn build_binpack_batch_tensors<B: Backend>(
 
     let items_t =
         Tensor::<B, 3>::from_data(TensorData::new(items, [batch, args.max_items, 3]), device);
-    let ems_t =
-        Tensor::<B, 3>::from_data(TensorData::new(ems, [batch, args.max_ems, 6]), device);
+    let ems_t = Tensor::<B, 3>::from_data(TensorData::new(ems, [batch, args.max_ems, 6]), device);
     let items_pad_t = Tensor::<B, 2, Bool>::from_data(
         TensorData::new(items_pad, [batch, args.max_items]),
         device,
     );
-    let ems_pad_t = Tensor::<B, 2, Bool>::from_data(
-        TensorData::new(ems_pad, [batch, args.max_ems]),
-        device,
-    );
+    let ems_pad_t =
+        Tensor::<B, 2, Bool>::from_data(TensorData::new(ems_pad, [batch, args.max_ems]), device);
     let items_valid_t = Tensor::<B, 2>::from_data(
         TensorData::new(items_valid_f32, [batch, args.max_items]),
         device,
@@ -129,7 +126,8 @@ pub fn build_actor_input_batch<B: Backend>(
                 let base = e * obs_dim;
                 flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
-            let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+            let obs_t =
+                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             ActorInput::Dense { obs: obs_t }
         }
         EnvModelKind::BinPackStructured => {
@@ -160,7 +158,8 @@ pub fn build_critic_input_batch<B: Backend>(
                 let base = e * obs_dim;
                 flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
-            let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+            let obs_t =
+                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             CriticInput::Dense { obs: obs_t }
         }
         EnvModelKind::BinPackStructured => {
@@ -193,7 +192,8 @@ pub fn build_policy_input_batch<B: Backend>(
                 let base = e * obs_dim;
                 flatten_obs_into(obs.borrow(), &mut obs_flat[base..base + obs_dim]);
             }
-            let obs_t = Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
+            let obs_t =
+                Tensor::<B, 2>::from_data(TensorData::new(obs_flat, [batch, obs_dim]), device);
             PolicyInput::Dense { obs: obs_t }
         }
         EnvModelKind::BinPackStructured => {

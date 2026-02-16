@@ -62,7 +62,10 @@ pub fn parse_binpack_obs(
     max_ems: usize,
 ) -> Result<BinPackObsView<'_>> {
     if obs.len() < 5 {
-        bail!("binpack obs must have at least 5 entries, got {}", obs.len());
+        bail!(
+            "binpack obs must have at least 5 entries, got {}",
+            obs.len()
+        );
     }
 
     let items = match &obs[0] {
@@ -236,7 +239,13 @@ impl Rollout {
         }
     }
 
-    pub fn new_binpack(t: usize, n: usize, max_items: usize, max_ems: usize, action_dim: usize) -> Self {
+    pub fn new_binpack(
+        t: usize,
+        n: usize,
+        max_items: usize,
+        max_ems: usize,
+        action_dim: usize,
+    ) -> Self {
         let num_samples = t * n;
         Self {
             t,
@@ -430,7 +439,15 @@ impl Rollout {
     pub fn minibatch(
         &self,
         indices: &[usize],
-    ) -> (Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    ) -> (
+        Vec<f32>,
+        Vec<i32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+        Vec<f32>,
+    ) {
         let bsz = indices.len();
 
         let mut obs_mb = vec![0.0f32; bsz * self.obs_dim];

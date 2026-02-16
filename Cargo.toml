@@ -2,7 +2,7 @@
 name = "rust_rl"
 version = "0.1.0"
 edition = "2018"
-rust-version = "1.88"
+rust-version = "1.89"
 build = "build.rs"
 
 [[bin]]
@@ -27,12 +27,13 @@ serde_yaml = "0.9"
 pyo3 = { version = "0.22", features = ["auto-initialize"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-bytemuck = "=1.23.1"
+bytemuck = "=1.25.0"
 
 
 # rustpool as a library dependency
 rustpool = { path = "../rustpool", package = "_rustpool", default-features = false }
 
 # --- Burn (CUDA + autodiff) ---
-burn = { version = "=0.18.0", features = ["cuda", "autodiff", "ndarray"] }
-burn-ndarray = "=0.18.0"
+burn = { version = "=0.20.1", features = ["cuda", "autodiff", "ndarray"] }
+burn-ndarray = "=0.20.1"
+cudarc = { version = "=0.18.2", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }

@@ -1,6 +1,6 @@
 use burn::tensor::activation::{log_softmax, softmax};
-use burn::tensor::Tensor;
 use burn::tensor::Int;
+use burn::tensor::Tensor;
 use rand::Rng;
 
 pub fn masked_logits<Bk: burn::tensor::backend::Backend>(

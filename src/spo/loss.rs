@@ -14,8 +14,10 @@ pub struct MpoDuals<B: Backend> {
 
 impl<B: Backend> MpoDuals<B> {
     pub fn new(init_log_temperature: f32, init_log_alpha: f32, device: &B::Device) -> Self {
-        let log_temperature = Tensor::<B, 1>::from_data(TensorData::new(vec![init_log_temperature], [1]), device);
-        let log_alpha = Tensor::<B, 1>::from_data(TensorData::new(vec![init_log_alpha], [1]), device);
+        let log_temperature =
+            Tensor::<B, 1>::from_data(TensorData::new(vec![init_log_temperature], [1]), device);
+        let log_alpha =
+            Tensor::<B, 1>::from_data(TensorData::new(vec![init_log_alpha], [1]), device);
         Self {
             log_temperature,
             log_alpha,
@@ -96,7 +98,8 @@ pub fn compute_discrete_mpo_losses<B: Backend>(
         TensorData::new(vec![(num_particles as f32).ln()], [1]),
         &device,
     );
-    let loss_temperature = (temperature.clone() * (eps_t + q_logsumexp_mean - log_num_actions)).mean();
+    let loss_temperature =
+        (temperature.clone() * (eps_t + q_logsumexp_mean - log_num_actions)).mean();
     let loss_kl_penalty = (alpha.clone().detach() * kl_tp.clone()).mean();
     let loss_alpha = (alpha.clone() * (eps_policy_t - kl_tp.detach())).mean();
 

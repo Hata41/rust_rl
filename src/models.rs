@@ -90,7 +90,9 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
 
         let ems_cross = self
             .ems_to_item_attn
-            .forward(MhaInput::new(ems.clone(), items.clone(), items.clone()).mask_pad(items_pad_mask))
+            .forward(
+                MhaInput::new(ems.clone(), items.clone(), items.clone()).mask_pad(items_pad_mask),
+            )
             .context;
         let items_cross = self
             .item_to_ems_attn
@@ -100,12 +102,12 @@ impl<Bk: burn::tensor::backend::Backend> TransformerBlock<Bk> {
         let ems = ems + ems_cross;
         let items = items + items_cross;
 
-        let ems_ff = self
-            .ems_ff2
-            .forward(burn::tensor::activation::relu(self.ems_ff1.forward(ems.clone())));
-        let items_ff = self
-            .item_ff2
-            .forward(burn::tensor::activation::relu(self.item_ff1.forward(items.clone())));
+        let ems_ff = self.ems_ff2.forward(burn::tensor::activation::relu(
+            self.ems_ff1.forward(ems.clone()),
+        ));
+        let items_ff = self.item_ff2.forward(burn::tensor::activation::relu(
+            self.item_ff1.forward(items.clone()),
+        ));
 
         (ems + ems_ff, items + items_ff)
     }
@@ -119,7 +121,13 @@ pub struct BinPackTorso<Bk: burn::tensor::backend::Backend> {
 }
 
 impl<Bk: burn::tensor::backend::Backend> BinPackTorso<Bk> {
-    pub fn new(embed_dim: usize, num_layers: usize, num_heads: usize, dropout: f64, device: &Bk::Device) -> Self {
+    pub fn new(
+        embed_dim: usize,
+        num_layers: usize,
+        num_heads: usize,
+        dropout: f64,
+        device: &Bk::Device,
+    ) -> Self {
         let ems_encoder = LinearConfig::new(6, embed_dim).init(device);
         let item_encoder = LinearConfig::new(3, embed_dim).init(device);
         let blocks = (0..num_layers)
@@ -144,12 +152,8 @@ impl<Bk: burn::tensor::backend::Backend> BinPackTorso<Bk> {
         let mut item_h = self.item_encoder.forward(items);
 
         for block in self.blocks.iter() {
-            let (next_ems, next_items) = block.forward(
-                ems_h,
-                item_h,
-                ems_pad_mask.clone(),
-                items_pad_mask.clone(),
-            );
+            let (next_ems, next_items) =
+                block.forward(ems_h, item_h, ems_pad_mask.clone(), items_pad_mask.clone());
             ems_h = next_ems;
             item_h = next_items;
         }
@@ -184,9 +188,7 @@ impl<Bk: burn::tensor::backend::Backend> BinPackActor<Bk> {
         ems_pad_mask: Tensor<Bk, 2, Bool>,
         items_pad_mask: Tensor<Bk, 2, Bool>,
     ) -> Tensor<Bk, 2> {
-        let (ems_h, item_h) = self
-            .torso
-            .forward(ems, items, ems_pad_mask, items_pad_mask);
+        let (ems_h, item_h) = self.torso.forward(ems, items, ems_pad_mask, items_pad_mask);
         let ems_h = self.ems_proj.forward(ems_h);
         let item_h = self.item_proj.forward(item_h);
 
@@ -224,9 +226,7 @@ impl<Bk: burn::tensor::backend::Backend> BinPackCritic<Bk> {
         ems_valid_f32: Tensor<Bk, 2>,
         items_valid_f32: Tensor<Bk, 2>,
     ) -> Tensor<Bk, 2> {
-        let (ems_h, item_h) = self
-            .torso
-            .forward(ems, items, ems_pad_mask, items_pad_mask);
+        let (ems_h, item_h) = self.torso.forward(ems, items, ems_pad_mask, items_pad_mask);
 
         let [batch, ems_len, hidden] = ems_h.dims();
         let [_, item_len, _] = item_h.dims();
@@ -254,7 +254,11 @@ impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, action_dim).init(device);
         let binpack = BinPackActor::new(hidden, device);
-        Self { torso, head, binpack }
+        Self {
+            torso,
+            head,
+            binpack,
+        }
     }
 
     pub fn forward(&self, obs: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
@@ -269,7 +273,8 @@ impl<Bk: burn::tensor::backend::Backend> Actor<Bk> {
         ems_pad_mask: Tensor<Bk, 2, Bool>,
         items_pad_mask: Tensor<Bk, 2, Bool>,
     ) -> Tensor<Bk, 2> {
-        self.binpack.forward(ems, items, ems_pad_mask, items_pad_mask)
+        self.binpack
+            .forward(ems, items, ems_pad_mask, items_pad_mask)
     }
 
     pub fn forward_input(&self, input: ActorInput<Bk>) -> Tensor<Bk, 2> {
@@ -297,7 +302,11 @@ impl<Bk: burn::tensor::backend::Backend> Critic<Bk> {
         let torso = Mlp::new(obs_dim, hidden, device);
         let head = LinearConfig::new(hidden, 1).init(device);
         let binpack = BinPackCritic::new(hidden, device);
-        Self { torso, head, binpack }
+        Self {
+            torso,
+            head,
+            binpack,
+        }
     }
 
     pub fn forward(&self, obs: Tensor<Bk, 2>) -> Tensor<Bk, 2> {
@@ -403,7 +412,9 @@ impl<Bk: burn::tensor::backend::Backend> Agent<Bk> {
     pub fn policy_value(&self, input: PolicyInput<Bk>) -> (Tensor<Bk, 2>, Tensor<Bk, 2>) {
         match input {
             PolicyInput::Dense { obs } => {
-                let logits = self.actor.forward_input(ActorInput::Dense { obs: obs.clone() });
+                let logits = self
+                    .actor
+                    .forward_input(ActorInput::Dense { obs: obs.clone() });
                 let values = self.critic.forward_input(CriticInput::Dense { obs });
                 (logits, values)
             }

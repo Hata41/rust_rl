@@ -124,13 +124,27 @@ impl AsyncEnvPool {
         let mut got = 0usize;
         while got < n {
             match self.recv_step_message()? {
-                WorkerMessage::StepResult { env_id, obs, reward, done, action_mask } => {
+                WorkerMessage::StepResult {
+                    env_id,
+                    obs,
+                    reward,
+                    done,
+                    action_mask,
+                } => {
                     if env_id < n {
-                        out[env_id] = StepOut { obs, reward, done, action_mask, state_ids: vec![] };
+                        out[env_id] = StepOut {
+                            obs,
+                            reward,
+                            done,
+                            action_mask,
+                            state_ids: vec![],
+                        };
                     }
                     got += 1;
                 }
-                WorkerMessage::SnapshotResult { .. } => unreachable!("recv_step_message returns only step results"),
+                WorkerMessage::SnapshotResult { .. } => {
+                    unreachable!("recv_step_message returns only step results")
+                }
             }
         }
         Ok(out)
@@ -138,7 +152,10 @@ impl AsyncEnvPool {
 
     fn recv_step_message(&self) -> Result<WorkerMessage> {
         {
-            let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+            let mut buffer = self
+                .message_buffer
+                .lock()
+                .expect("message buffer mutex poisoned");
             if let Some(idx) = buffer
                 .iter()
                 .position(|msg| matches!(msg, WorkerMessage::StepResult { .. }))
@@ -154,7 +171,10 @@ impl AsyncEnvPool {
             match msg {
                 WorkerMessage::StepResult { .. } => return Ok(msg),
                 WorkerMessage::SnapshotResult { .. } => {
-                    let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+                    let mut buffer = self
+                        .message_buffer
+                        .lock()
+                        .expect("message buffer mutex poisoned");
                     buffer.push_back(msg);
                 }
             }
@@ -163,7 +183,10 @@ impl AsyncEnvPool {
 
     fn recv_snapshot_message(&self, env_ids: &[usize]) -> Result<(usize, Box<dyn RlEnv>)> {
         {
-            let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+            let mut buffer = self
+                .message_buffer
+                .lock()
+                .expect("message buffer mutex poisoned");
             if let Some(idx) = buffer.iter().position(|msg| {
                 matches!(msg, WorkerMessage::SnapshotResult { env_id, .. } if env_ids.contains(env_id))
             }) {
@@ -180,7 +203,10 @@ impl AsyncEnvPool {
                     return Ok((env_id, snapshot));
                 }
                 other => {
-                    let mut buffer = self.message_buffer.lock().expect("message buffer mutex poisoned");
+                    let mut buffer = self
+                        .message_buffer
+                        .lock()
+                        .expect("message buffer mutex poisoned");
                     buffer.push_back(other);
                 }
             }
@@ -211,10 +237,14 @@ impl AsyncEnvPool {
             return Ok(vec![]);
         }
 
-        let mut shard_requests: Vec<Vec<usize>> = (0..self.num_threads).map(|_| Vec::new()).collect();
+        let mut shard_requests: Vec<Vec<usize>> =
+            (0..self.num_threads).map(|_| Vec::new()).collect();
         for &env_id in env_ids {
             if env_id >= self.num_envs {
-                bail!("env_id {env_id} out of bounds for num_envs {}", self.num_envs);
+                bail!(
+                    "env_id {env_id} out of bounds for num_envs {}",
+                    self.num_envs
+                );
             }
             let shard_id = env_id % self.num_threads;
             shard_requests[shard_id].push(env_id);
@@ -263,13 +293,20 @@ impl AsyncEnvPool {
 
     pub fn simulate_batch(&self, state_ids: &[i32], actions: &[i32]) -> Result<Vec<StepOut>> {
         if state_ids.len() != actions.len() {
-            bail!("state_ids length ({}) must match actions length ({})", state_ids.len(), actions.len());
+            bail!(
+                "state_ids length ({}) must match actions length ({})",
+                state_ids.len(),
+                actions.len()
+            );
         }
         if state_ids.is_empty() {
             return Ok(vec![]);
         }
 
-        let envs = self.registry.get_clones(state_ids).map_err(anyhow::Error::msg)?;
+        let envs = self
+            .registry
+            .get_clones(state_ids)
+            .map_err(anyhow::Error::msg)?;
         let rollouts = envs
             .into_par_iter()
             .zip(actions.par_iter().copied())

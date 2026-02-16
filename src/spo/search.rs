@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use burn::tensor::backend::Backend;
-use rand::rngs::StdRng;
 use rand::distributions::{Distribution as RandDistribution, WeightedIndex};
+use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::Gamma;
 use rayon::prelude::*;
@@ -51,10 +51,7 @@ fn softmax(values: &[f32]) -> Vec<f32> {
         .iter()
         .copied()
         .fold(f32::NEG_INFINITY, |a, b| if a > b { a } else { b });
-    let exps = values
-        .iter()
-        .map(|v| (v - max_v).exp())
-        .collect::<Vec<_>>();
+    let exps = values.iter().map(|v| (v - max_v).exp()).collect::<Vec<_>>();
     let denom = exps.iter().sum::<f32>().max(1.0e-12);
     exps.into_iter().map(|x| x / denom).collect()
 }
@@ -78,7 +75,11 @@ fn effective_sample_size(weights: &[f32]) -> f32 {
     1.0 / denom
 }
 
-fn resample_indices<R: Rng + ?Sized>(weights: &[f32], num_samples: usize, rng: &mut R) -> Vec<usize> {
+fn resample_indices<R: Rng + ?Sized>(
+    weights: &[f32],
+    num_samples: usize,
+    rng: &mut R,
+) -> Vec<usize> {
     let dist = WeightedIndex::new(weights)
         .ok()
         .or_else(|| WeightedIndex::new(vec![1.0f32; weights.len()]).ok());
@@ -94,10 +95,7 @@ fn sample_dirichlet<R: Rng + ?Sized>(alpha: f32, dim: usize, rng: &mut R) -> Vec
     let mut draws = vec![0.0f32; dim];
     let mut sum_draw = 0.0f32;
     for d in draws.iter_mut() {
-        let v = gamma
-            .as_ref()
-            .map(|g| g.sample(rng) as f32)
-            .unwrap_or(1.0);
+        let v = gamma.as_ref().map(|g| g.sample(rng) as f32).unwrap_or(1.0);
         *d = v;
         sum_draw += v;
     }
@@ -212,7 +210,11 @@ pub fn run_smc_search<B: Backend>(
         mask_flat.reserve(n * action_dim);
         for mask in current_masks.iter() {
             if mask.len() != action_dim {
-                bail!("search action mask mismatch: got {}, expected {}", mask.len(), action_dim);
+                bail!(
+                    "search action mask mismatch: got {}, expected {}",
+                    mask.len(),
+                    action_dim
+                );
             }
             for &m in mask {
                 mask_flat.push(if m { 1.0 } else { 0.0 });
@@ -262,11 +264,7 @@ pub fn run_smc_search<B: Backend>(
         let next_obs = steps.iter().map(|s| s.obs.clone()).collect::<Vec<_>>();
         let next_values_t = agent
             .critic_values(build_critic_input_batch::<B>(
-                &next_obs,
-                model_kind,
-                args,
-                obs_dim,
-                device,
+                &next_obs, model_kind, args, obs_dim, device,
             )?)
             .reshape([n]);
         let next_values = next_values_t
@@ -280,7 +278,8 @@ pub fn run_smc_search<B: Backend>(
             particle_td_weights[i] += td_error * terminal_mask;
 
             let discount = if steps[i].done { 0.0 } else { 1.0 };
-            let gae_decay = (cfg.search_gamma * cfg.search_gae_lambda * discount).powi(depth_idx as i32);
+            let gae_decay =
+                (cfg.search_gamma * cfg.search_gae_lambda * discount).powi(depth_idx as i32);
             particle_gae[i] += td_error * gae_decay;
 
             particle_terminal[i] = particle_terminal[i] || steps[i].done;
@@ -352,11 +351,9 @@ pub fn run_smc_search<B: Backend>(
                         for &j in sampled.iter() {
                             let idx = start + j;
                             chunk.state_ids.push(
-                                steps[idx]
-                                    .state_ids
-                                    .first()
-                                    .copied()
-                                    .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                                steps[idx].state_ids.first().copied().ok_or_else(|| {
+                                    anyhow::anyhow!("simulate_batch returned empty state_ids")
+                                })?,
                             );
                             chunk.obs.push(steps[idx].obs.clone());
                             chunk.masks.push(steps[idx].action_mask.clone());
@@ -371,11 +368,9 @@ pub fn run_smc_search<B: Backend>(
                     } else {
                         for idx in start..end {
                             chunk.state_ids.push(
-                                steps[idx]
-                                    .state_ids
-                                    .first()
-                                    .copied()
-                                    .ok_or_else(|| anyhow::anyhow!("simulate_batch returned empty state_ids"))?,
+                                steps[idx].state_ids.first().copied().ok_or_else(|| {
+                                    anyhow::anyhow!("simulate_batch returned empty state_ids")
+                                })?,
                             );
                             chunk.obs.push(steps[idx].obs.clone());
                             chunk.masks.push(steps[idx].action_mask.clone());
@@ -456,11 +451,7 @@ pub fn run_smc_search<B: Backend>(
 
         if cfg.root_exploration_dirichlet_fraction > 0.0 {
             let frac = cfg.root_exploration_dirichlet_fraction.clamp(0.0, 1.0);
-            let dir_noise = sample_dirichlet(
-                cfg.root_exploration_dirichlet_alpha,
-                action_dim,
-                rng,
-            );
+            let dir_noise = sample_dirichlet(cfg.root_exploration_dirichlet_alpha, action_dim, rng);
             for a in 0..action_dim {
                 action_probs[a] = (1.0 - frac) * action_probs[a] + frac * dir_noise[a];
             }
