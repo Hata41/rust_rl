@@ -86,7 +86,12 @@ See runtime sources for exact emission points:
 
 ## Filtering
 
-Use tracing filter env vars as usual (`RUST_LOG=info`, etc.).
+Filtering precedence:
+
+- If `RUST_LOG` is set, it is used directly.
+- Otherwise, defaults come from YAML `logging` section (`log_level`, `backend_logs_visible`).
+
+Default config behavior keeps CubeCL/CUDA backend context logs hidden to reduce dashboard noise.
 
 ## Maintenance checklist for telemetry changes
 

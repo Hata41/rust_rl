@@ -198,6 +198,14 @@ pub struct Args {
     /// SPO: fixed temperature fallback when adaptive is disabled.
     #[arg(long, default_value_t = 0.5)]
     pub fixed_temperature: f32,
+
+    /// Base tracing level used when RUST_LOG is not set.
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Show backend (CubeCL/CUDA) context logs in dashboard output.
+    #[arg(long, default_value_t = false)]
+    pub backend_logs_visible: bool,
 }
 
 impl Default for Args {
@@ -250,6 +258,8 @@ impl Default for Args {
             resampling_ess_threshold: 0.5,
             adaptive_temperature: true,
             fixed_temperature: 0.5,
+            log_level: "info".to_string(),
+            backend_logs_visible: false,
         }
     }
 }
@@ -265,6 +275,14 @@ struct FileConfig {
     evaluation: EvaluationConfig,
     hardware: HardwareConfig,
     spo: SpoConfig,
+    logging: LoggingConfig,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct LoggingConfig {
+    log_level: Option<String>,
+    backend_logs_visible: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -349,6 +367,16 @@ struct HardwareConfig {
 }
 
 impl Args {
+    pub fn default_tracing_filter(&self) -> String {
+        let mut directives = vec![self.log_level.trim().to_string()];
+
+        if !self.backend_logs_visible {
+            directives.push("cubecl_cuda::compute::context=off".to_string());
+        }
+
+        directives.join(",")
+    }
+
     pub fn load() -> Result<Self> {
         let argv = std::env::args_os().collect::<Vec<_>>();
         let cli_args = Self::try_parse_from(&argv)
@@ -434,6 +462,9 @@ impl Args {
         set_if_some!(device_type, file.hardware.device_type);
         set_if_some!(cuda_device, file.hardware.cuda_device);
 
+        set_if_some!(log_level, file.logging.log_level);
+        set_if_some!(backend_logs_visible, file.logging.backend_logs_visible);
+
         set_if_some!(num_particles, file.spo.num_particles);
         set_if_some!(search_depth, file.spo.search_depth);
         set_if_some!(replay_buffer_size, file.spo.replay_buffer_size);
@@ -502,6 +533,9 @@ impl Args {
 
         set_if_cli!(device_type, "device_type");
         set_if_cli!(cuda_device, "cuda_device");
+
+        set_if_cli!(log_level, "log_level");
+        set_if_cli!(backend_logs_visible, "backend_logs_visible");
 
         set_if_cli!(num_particles, "num_particles");
         set_if_cli!(search_depth, "search_depth");

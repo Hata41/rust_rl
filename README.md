@@ -53,6 +53,35 @@ cargo run --release -- \
   --rollout-length 128
 ```
 
+### 5) Logging profiles (YAML-controlled)
+
+Backend context logs are hidden by default through the YAML `logging` section.
+
+Quiet profile (recommended):
+
+```yaml
+logging:
+  log_level: "info"
+  backend_logs_visible: false
+```
+
+Verbose backend profile:
+
+```yaml
+logging:
+  log_level: "info"
+  backend_logs_visible: true
+```
+
+Run PPO/SPO with a selected profile file:
+
+```bash
+cargo run --release -- --config ppo_config.yaml
+cargo run --release --bin spo -- --config spo_config.yaml
+```
+
+Note: setting `RUST_LOG` in your shell still overrides YAML logging defaults.
+
 ## Execute common scenarios
 
 ### BinPack on CPU

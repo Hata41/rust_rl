@@ -49,6 +49,7 @@ Top-level YAML sections:
 - `architecture`
 - `evaluation`
 - `hardware`
+- `logging`
 - `spo`
 
 Both binaries load the same schema. Algorithm-specific keys are simply ignored by the other trainer unless read at runtime.
@@ -141,6 +142,18 @@ Execution backend and device index:
 
 - `device_type` (`cpu` or `cuda`)
 - `cuda_device`
+
+### `logging`
+
+Runtime tracing defaults used when `RUST_LOG` is not explicitly set:
+
+- `log_level`: base level directive (for example `info`, `debug`, `warn`)
+- `backend_logs_visible`: controls CubeCL/CUDA backend context visibility
+
+Default behavior:
+
+- `backend_logs_visible: false` hides noisy backend context events by default.
+- Setting `backend_logs_visible: true` makes those backend events visible again.
 
 ### `spo`
 

@@ -73,3 +73,9 @@ hardware:
   device_type: "cpu"
   # CUDA device index used in single-process mode
   cuda_device: 0
+
+logging:
+  # Base tracing level used when RUST_LOG is not set
+  log_level: "info"
+  # Keep CubeCL/CUDA backend context logs hidden by default
+  backend_logs_visible: false
