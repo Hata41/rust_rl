@@ -1545,8 +1545,6 @@ dependencies = [
 [[package]]
 name = "cubecl-cuda"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f74a5750c45090d1fc5ddf6a19fea9a099aa1f6800b78f1167a2d60182d1d96"
 dependencies = [
  "bytemuck",
  "cubecl-common",
