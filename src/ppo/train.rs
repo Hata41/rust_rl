@@ -153,6 +153,12 @@ fn run_deterministic_eval<B: AutodiffBackend>(
     let mut ep_len = vec![0usize; num_eval_envs];
     let mut completed_returns = Vec::<f32>::with_capacity(num_eval_episodes);
     let mut completed_lengths = Vec::<usize>::with_capacity(num_eval_episodes);
+    let base_quota = num_eval_episodes / num_eval_envs;
+    let extra = num_eval_episodes % num_eval_envs;
+    let per_env_quota = (0..num_eval_envs)
+        .map(|env_idx| base_quota + usize::from(env_idx < extra))
+        .collect::<Vec<_>>();
+    let mut per_env_count = vec![0usize; num_eval_envs];
 
     while completed_returns.len() < num_eval_episodes {
         let mut mask_f = vec![0.0f32; num_eval_envs * action_dim];
@@ -193,9 +199,12 @@ fn run_deterministic_eval<B: AutodiffBackend>(
             ep_len[e] += 1;
 
             if step_out[e].done {
-                if completed_returns.len() < num_eval_episodes {
+                if completed_returns.len() < num_eval_episodes
+                    && per_env_count[e] < per_env_quota[e]
+                {
                     completed_returns.push(ep_return[e]);
                     completed_lengths.push(ep_len[e]);
+                    per_env_count[e] += 1;
                 }
                 ep_return[e] = 0.0;
                 ep_len[e] = 0;
@@ -844,7 +853,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 let eval_stats = run_deterministic_eval::<B>(
                     &agent,
                     eval_pool,
-                    args.seed + 999,
+                    args.seed.wrapping_add(999).wrapping_add(update as u64),
                     eval_num_envs,
                     args.num_eval_episodes,
                     model_kind,

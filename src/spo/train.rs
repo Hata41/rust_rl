@@ -168,6 +168,12 @@ fn run_search_eval<B: AutodiffBackend>(
     let mut ep_len = vec![0usize; args.num_eval_envs];
     let mut completed_returns = Vec::<f32>::with_capacity(args.num_eval_episodes);
     let mut completed_lengths = Vec::<usize>::with_capacity(args.num_eval_episodes);
+    let base_quota = args.num_eval_episodes / args.num_eval_envs;
+    let extra = args.num_eval_episodes % args.num_eval_envs;
+    let per_env_quota = (0..args.num_eval_envs)
+        .map(|env_idx| base_quota + usize::from(env_idx < extra))
+        .collect::<Vec<_>>();
+    let mut per_env_count = vec![0usize; args.num_eval_envs];
 
     while completed_returns.len() < args.num_eval_episodes {
         let cur_obs = cur_steps.iter().map(|s| &s.obs).collect::<Vec<_>>();
@@ -217,9 +223,12 @@ fn run_search_eval<B: AutodiffBackend>(
             ep_return[env_idx] += next_steps[env_idx].reward;
             ep_len[env_idx] += 1;
             if next_steps[env_idx].done {
-                if completed_returns.len() < args.num_eval_episodes {
+                if completed_returns.len() < args.num_eval_episodes
+                    && per_env_count[env_idx] < per_env_quota[env_idx]
+                {
                     completed_returns.push(ep_return[env_idx]);
                     completed_lengths.push(ep_len[env_idx]);
+                    per_env_count[env_idx] += 1;
                 }
                 ep_return[env_idx] = 0.0;
                 ep_len[env_idx] = 0;
@@ -795,7 +804,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                     obs_dim,
                     action_dim,
                     &device,
-                    args.seed.wrapping_add(update as u64),
+                    args.seed.wrapping_add(999).wrapping_add(update as u64),
                 )?;
                 let eval_duration_ms = eval_started.elapsed().as_secs_f64() * 1_000.0;
 
