@@ -1,0 +1,8 @@
+[book]
+authors = ["Project Contributors"]
+language = "en"
+src = "src"
+title = "rust_rl Documentation"
+
+[build]
+build-dir = "docs/_build"

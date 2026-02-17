@@ -58,6 +58,10 @@ coverage/
 
 # Documentation
 docs/_build/
+book/
+.mdbook/
+docs/**/*.html
+docs/**/index.html
 
 # Backup files
 *~
