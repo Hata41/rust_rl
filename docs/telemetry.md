@@ -5,7 +5,11 @@ This project uses a dual telemetry pipeline for PPO and SPO:
 - Tracing (OTLP): spans/events export to MLflow OTLP (`/v1/traces`)
 - Metrics (REST): scalar metrics export to MLflow REST (`/api/2.0/mlflow/runs/log-batch`)
 
-Both are initialized through shared `TrainingContext::initialize(...)` in `src/telemetry.rs`.
+Both are initialized through shared `TrainingContext::initialize(...)` in `src/common/runtime/telemetry.rs`.
+
+Source guide:
+
+- [src/common/runtime/README.md](../src/common/runtime/README.md)
 
 ## Initialization path
 
@@ -28,7 +32,7 @@ Shared category contract:
 - `EVALUATOR`
 - `MISC`
 
-Category names are normalized by shared formatter logic in `src/telemetry.rs`.
+Category names are normalized by shared formatter logic in `src/common/runtime/telemetry.rs`.
 
 ## Metric key mapping
 

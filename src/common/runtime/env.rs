@@ -14,7 +14,7 @@ use rustpool::core::worker::{worker_loop, WorkerAction, WorkerMessage};
 use rustpool::envs::binpack::{BinPackConfig, BinPackEnv, RewardFnType};
 use rustpool::envs::maze::{MazeConfig, MazeEnv};
 
-use crate::config::Args;
+use crate::common::config::Args;
 
 type EnvFactory = Arc<dyn Fn(&Args, u64) -> Result<Box<dyn RlEnv>> + Send + Sync + 'static>;
 

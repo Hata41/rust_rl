@@ -10,6 +10,12 @@ For runtime step-by-step behavior, see:
 - PPO: [training-loop.md](training-loop.md)
 - SPO: [spo-training-loop.md](spo-training-loop.md)
 
+Source folder guides:
+
+- [src/README.md](../src/README.md)
+- [src/algorithms/README.md](../src/algorithms/README.md)
+- [src/common/README.md](../src/common/README.md)
+
 ## Crate boundaries
 
 ### `rust_rl` responsibilities
@@ -40,52 +46,52 @@ Core modules in `rust_rl`:
 
 - `src/bin/ppo.rs`: PPO bootstrap + backend selection + `TrainingContext` init
 - `src/bin/spo.rs`: SPO bootstrap + backend selection + `TrainingContext` init
-- `src/config.rs`: shared schema + YAML/CLI merge + per-binary loaders
-- `src/env.rs`: async env pool, worker routing, snapshot lifecycle integration, env registry
-- `src/env_model.rs`: trait-based observation adapters (`DenseObservationAdapter`, `BinPackObservationAdapter`)
-- `src/models.rs`: actor/critic definitions and architecture-aware construction
-- `src/evaluation.rs`: shared evaluation loop scaffold
-- `src/training_utils.rs`: shared LR decay + gradient clipping helpers
-- `src/buffer_common.rs`: shared buffer flattening/storage helpers
-- `src/telemetry.rs`: shared formatter/MLflow/OTLP wiring and `TrainingContext`
-- `src/ppo/*`: PPO-specific buffer/loss/training
-- `src/spo/*`: SPO-specific search/buffer/loss/training
+- `src/common/config.rs`: shared schema + YAML/CLI merge + per-binary loaders
+- `src/common/runtime/env.rs`: async env pool, worker routing, snapshot lifecycle integration, env registry
+- `src/common/model/observation_adapter.rs`: trait-based observation adapters (`DenseObservationAdapter`, `BinPackObservationAdapter`)
+- `src/common/model/models.rs`: actor/critic definitions and architecture-aware construction
+- `src/common/runtime/evaluation.rs`: shared evaluation loop scaffold
+- `src/common/utils/optimization.rs`: shared LR decay + gradient clipping helpers
+- `src/common/utils/buffer.rs`: shared buffer flattening/storage helpers
+- `src/common/runtime/telemetry.rs`: shared formatter/MLflow/OTLP wiring and `TrainingContext`
+- `src/algorithms/ppo/*`: PPO-specific buffer/loss/training
+- `src/algorithms/spo/*`: SPO-specific search/buffer/loss/training
 
 ## High-level dependency graph
 
 ```mermaid
 flowchart TD
-    BINP[src/bin/ppo.rs] --> CFG[src/config.rs]
-    BINP --> TPPO[src/ppo/train.rs]
+    BINP[src/bin/ppo.rs] --> CFG[src/common/config.rs]
+    BINP --> TPPO[src/algorithms/ppo/train.rs]
     BINS[src/bin/spo.rs] --> CFG
-    BINS --> TSPO[src/spo/train.rs]
+    BINS --> TSPO[src/algorithms/spo/train.rs]
 
-    TPPO --> ENV[src/env.rs]
+    TPPO --> ENV[src/common/runtime/env.rs]
     TSPO --> ENV
 
-    TPPO --> EM[src/env_model.rs]
+    TPPO --> EM[src/common/model/observation_adapter.rs]
     TSPO --> EM
 
-    TPPO --> MOD[src/models.rs]
+    TPPO --> MOD[src/common/model/models.rs]
     TSPO --> MOD
 
-    TPPO --> EV[src/evaluation.rs]
+    TPPO --> EV[src/common/runtime/evaluation.rs]
     TSPO --> EV
 
-    TPPO --> TU[src/training_utils.rs]
+    TPPO --> TU[src/common/utils/optimization.rs]
     TSPO --> TU
 
-    TPPO --> BC[src/buffer_common.rs]
+    TPPO --> BC[src/common/utils/buffer.rs]
     TSPO --> BC
 
-    TPPO --> LPPO[src/ppo/loss.rs]
-    TPPO --> BPPO[src/ppo/buffer.rs]
+    TPPO --> LPPO[src/algorithms/ppo/loss.rs]
+    TPPO --> BPPO[src/algorithms/ppo/buffer.rs]
 
-    TSPO --> LSPO[src/spo/loss.rs]
-    TSPO --> BSPO[src/spo/buffer.rs]
-    TSPO --> SSPO[src/spo/search.rs]
+    TSPO --> LSPO[src/algorithms/spo/loss.rs]
+    TSPO --> BSPO[src/algorithms/spo/buffer.rs]
+    TSPO --> SSPO[src/algorithms/spo/search.rs]
 
-    BINP --> TEL[src/telemetry.rs]
+    BINP --> TEL[src/common/runtime/telemetry.rs]
     BINS --> TEL
 
     ENV --> RP[rustpool worker/env/state registry]
@@ -110,7 +116,7 @@ PPO decoupling rule:
 
 ## Observation adapter contract (`env_model`)
 
-`src/env_model.rs` is the shared tensor-construction boundary for PPO/SPO/search.
+`src/common/model/observation_adapter.rs` is the shared tensor-construction boundary for PPO/SPO/search.
 
 Responsibilities:
 
@@ -128,7 +134,7 @@ Invariants:
 
 ## Environment registry contract
 
-`src/env.rs` now uses a registry pattern instead of hardcoded task matching.
+`src/common/runtime/env.rs` now uses a registry pattern instead of hardcoded task matching.
 
 - Built-ins are registered at startup (`Maze-v0`, `BinPack-v0`).
 - New tasks can be added via `register_env_factory(...)` without modifying core switch logic.
@@ -167,4 +173,4 @@ When modifying internals:
 - If env observation schema changes, update adapter implementations, trainers, search path, and docs together.
 - If snapshot lifecycle calls change, verify accounting ownership remains in `rust_rl`.
 - If logging keys/categories change, maintain PPO/SPO schema compatibility.
-- If config keys change, update `src/config.rs`, template YAML files, and docs together.
+- If config keys change, update `src/common/config.rs`, template YAML files, and docs together.

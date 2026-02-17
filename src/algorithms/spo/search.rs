@@ -7,11 +7,11 @@ use rand_distr::Gamma;
 use rayon::prelude::*;
 use rustpool::core::types::GenericObs;
 
-use crate::config::Args;
-use crate::env::{AsyncEnvPool, StepOut};
-use crate::env_model::ObservationAdapter;
-use crate::models::Agent;
-use crate::ppo::loss::sample_actions_categorical;
+use crate::common::config::Args;
+use crate::common::runtime::env::{AsyncEnvPool, StepOut};
+use crate::common::model::observation_adapter::ObservationAdapter;
+use crate::common::model::models::Agent;
+use crate::algorithms::ppo::loss::sample_actions_categorical;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {

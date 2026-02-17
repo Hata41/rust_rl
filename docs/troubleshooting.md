@@ -2,6 +2,12 @@
 
 This guide covers shared runtime contracts plus PPO/SPO-specific failure modes.
 
+Source guides:
+
+- [src/common/runtime/README.md](../src/common/runtime/README.md)
+- [src/common/model/README.md](../src/common/model/README.md)
+- [src/algorithms/README.md](../src/algorithms/README.md)
+
 ## One-Strike policy / auto-reset confusion
 
 Invalid actions can terminate episodes immediately depending on env semantics.
@@ -80,11 +86,11 @@ If mismatch appears:
 
 - check binary initialization path,
 - check trainer emit fields,
-- check formatter/category normalization in `src/telemetry.rs`.
+- check formatter/category normalization in `src/common/runtime/telemetry.rs`.
 
 ## CUDA startup failures
 
-Current behavior in `src/backend.rs`:
+Current behavior in `src/common/runtime/backend.rs`:
 
 - if CUDA is requested and probe fails, process panics with diagnostic warning.
 - there is no automatic CPU fallback in current code path.

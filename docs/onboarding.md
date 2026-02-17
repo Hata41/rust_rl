@@ -2,6 +2,11 @@
 
 Use this guide to get from clean checkout to reliable PPO/SPO runs with current config and telemetry semantics.
 
+Source guides:
+
+- [src/README.md](../src/README.md)
+- [src/bin/README.md](../src/bin/README.md)
+
 ## Local setup
 
 1. Install Rust stable toolchain.

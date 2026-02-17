@@ -4,9 +4,9 @@ use burn::tensor::{Bool, Tensor, TensorData};
 use rustpool::core::rl_env::RlEnv;
 use rustpool::core::types::GenericObs;
 
-use crate::config::{Args, ObservationAdapterKind};
-use crate::models::{ActorInput, CriticInput, PolicyInput};
-use crate::ppo::buffer::{flatten_obs, flatten_obs_into, parse_binpack_obs};
+use crate::common::config::{Args, ObservationAdapterKind};
+use crate::common::model::models::{ActorInput, CriticInput, PolicyInput};
+use crate::algorithms::ppo::buffer::{flatten_obs, flatten_obs_into, parse_binpack_obs};
 
 pub trait ObservationAdapter<B: Backend>: Send + Sync {
     fn uses_binpack_architecture(&self) -> bool;

@@ -10,16 +10,16 @@ use std::collections::VecDeque;
 use std::time::Instant;
 use tracing::{debug, info};
 
-use crate::config::{Args, DistInfo};
-use crate::env::{make_env, AsyncEnvPool};
-use crate::env_model::{ObservationAdapter, resolve_observation_adapter};
-use crate::evaluation::{run_eval_with_policy, EvalStats};
-use crate::models::Agent;
-use crate::spo::buffer::ReplayBuffer;
-use crate::spo::loss::{compute_discrete_mpo_losses, MpoDuals};
-use crate::spo::search::{run_smc_search, SearchConfig};
-use crate::telemetry::TrainingContext;
-use crate::training_utils::{clip_global_grad_norm, linear_decay_alpha};
+use crate::common::config::{Args, DistInfo};
+use crate::common::runtime::env::{make_env, AsyncEnvPool};
+use crate::common::model::observation_adapter::{ObservationAdapter, resolve_observation_adapter};
+use crate::common::runtime::evaluation::{run_eval_with_policy, EvalStats};
+use crate::common::model::models::Agent;
+use crate::algorithms::spo::buffer::ReplayBuffer;
+use crate::algorithms::spo::loss::{compute_discrete_mpo_losses, MpoDuals};
+use crate::algorithms::spo::search::{run_smc_search, SearchConfig};
+use crate::common::runtime::telemetry::TrainingContext;
+use crate::common::utils::optimization::{clip_global_grad_norm, linear_decay_alpha};
 
 struct SpoOptimizationSummary {
     elapsed_ms: f64,
@@ -49,8 +49,8 @@ impl SpoOptimizer {
         agent_online: &mut Agent<B>,
         agent_target: &mut Agent<B>,
         duals: &mut MpoDuals<B>,
-        actor_optim: &mut impl Optimizer<crate::models::Actor<B>, B>,
-        critic_optim: &mut impl Optimizer<crate::models::Critic<B>, B>,
+        actor_optim: &mut impl Optimizer<crate::common::model::models::Actor<B>, B>,
+        critic_optim: &mut impl Optimizer<crate::common::model::models::Critic<B>, B>,
         dual_optim: &mut impl Optimizer<MpoDuals<B>, B>,
         current_actor_lr: f64,
         current_critic_lr: f64,
@@ -173,12 +173,12 @@ impl SpoOptimizer {
                     let mut grads = parts.total_loss.backward();
 
                     let mut grads_actor =
-                        GradientsParams::from_module::<B, crate::models::Actor<B>>(
+                        GradientsParams::from_module::<B, crate::common::model::models::Actor<B>>(
                             &mut grads,
                             &agent_online.actor,
                         );
                     let mut grads_critic =
-                        GradientsParams::from_module::<B, crate::models::Critic<B>>(
+                        GradientsParams::from_module::<B, crate::common::model::models::Critic<B>>(
                             &mut grads,
                             &agent_online.critic,
                         );
@@ -457,8 +457,8 @@ fn run_loop<B: AutodiffBackend>(
     );
     let mut agent_target = agent_online.clone();
     let mut duals = MpoDuals::<B>::new(args.init_log_temperature, args.init_log_alpha, &device);
-    let mut actor_optim = AdamConfig::new().init::<B, crate::models::Actor<B>>();
-    let mut critic_optim = AdamConfig::new().init::<B, crate::models::Critic<B>>();
+    let mut actor_optim = AdamConfig::new().init::<B, crate::common::model::models::Actor<B>>();
+    let mut critic_optim = AdamConfig::new().init::<B, crate::common::model::models::Critic<B>>();
     let mut dual_optim = AdamConfig::new().init::<B, MpoDuals<B>>();
     let mut rng = StdRng::seed_from_u64(args.seed);
     let mut ep_return = vec![0.0f32; args.num_envs];

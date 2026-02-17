@@ -31,6 +31,9 @@ optimization:
 
 architecture:
   hidden_dim: 16
+  # Optional explicit adapter selection: "dense" | "binpack".
+  # Set to null to use metadata auto-detection.
+  observation_adapter: null
   seed: 42
 
 evaluation:
@@ -47,6 +50,10 @@ logging:
   log_level: "info"
   # Keep CubeCL/CUDA backend context logs hidden by default
   backend_logs_visible: false
+  # OTLP base endpoint (traces export uses /v1/traces).
+  otlp_endpoint: "http://localhost:5000"
+  # Optional existing MLflow run id; null triggers auto-create on lead rank.
+  mlflow_run_id: null
 
 spo:
   num_particles: 4

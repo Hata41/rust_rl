@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 
-use crate::env::{AsyncEnvPool, StepOut};
+use crate::common::runtime::env::{AsyncEnvPool, StepOut};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EvalStats {

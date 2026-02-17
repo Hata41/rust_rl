@@ -5,6 +5,12 @@ This page documents SPO runtime behavior after modular refactor.
 For static boundaries, see [architecture.md](architecture.md).
 For PPO runtime, see [training-loop.md](training-loop.md).
 
+Source guides:
+
+- [src/algorithms/spo/README.md](../src/algorithms/spo/README.md)
+- [src/common/model/README.md](../src/common/model/README.md)
+- [src/common/runtime/README.md](../src/common/runtime/README.md)
+
 ## Runtime sequence
 
 `src/bin/spo.rs` -> `SpoArgs::load` -> `TrainingContext::initialize` -> `SpoTrainer::run`.
@@ -23,13 +29,13 @@ Per update:
 ## Key components
 
 - Entrypoint: `src/bin/spo.rs`
-- Trainer wrapper: `src/spo/train.rs` (`SpoTrainer`)
-- Optimizer phase: `src/spo/train.rs` (`SpoOptimizer`)
-- Search: `src/spo/search.rs`
-- Replay: `src/spo/buffer.rs`
-- MPO losses/duals: `src/spo/loss.rs`
-- Shared evaluator: `src/evaluation.rs`
-- Observation adapter: `src/env_model.rs`
+- Trainer wrapper: `src/algorithms/spo/train.rs` (`SpoTrainer`)
+- Optimizer phase: `src/algorithms/spo/train.rs` (`SpoOptimizer`)
+- Search: `src/algorithms/spo/search.rs`
+- Replay: `src/algorithms/spo/buffer.rs`
+- MPO losses/duals: `src/algorithms/spo/loss.rs`
+- Shared evaluator: `src/common/runtime/evaluation.rs`
+- Observation adapter: `src/common/model/observation_adapter.rs`
 
 ## Search and snapshot contract
 
@@ -67,8 +73,8 @@ Seed offsets and ordering are preserved in runtime code; when editing update ord
 
 ## Edit map
 
-- Search behavior: `src/spo/search.rs`
-- Replay storage/sampling: `src/spo/buffer.rs`
-- Optimization details: `src/spo/train.rs` (`SpoOptimizer`)
-- Evaluation closure behavior: `src/spo/train.rs` + `src/evaluation.rs`
-- Observation conversion: `src/env_model.rs`
+- Search behavior: `src/algorithms/spo/search.rs`
+- Replay storage/sampling: `src/algorithms/spo/buffer.rs`
+- Optimization details: `src/algorithms/spo/train.rs` (`SpoOptimizer`)
+- Evaluation closure behavior: `src/algorithms/spo/train.rs` + `src/common/runtime/evaluation.rs`
+- Observation conversion: `src/common/model/observation_adapter.rs`

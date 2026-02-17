@@ -3,7 +3,7 @@ use burn::optim::GradientsParams;
 use burn::tensor::backend::AutodiffBackend;
 use burn::tensor::Tensor;
 
-use crate::models::{Actor, Critic};
+use crate::common::model::models::{Actor, Critic};
 
 pub fn linear_decay_alpha(update: usize, num_updates: usize) -> f64 {
     if num_updates == 0 {

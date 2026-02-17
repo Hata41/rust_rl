@@ -3,10 +3,10 @@ use burn::backend::autodiff::Autodiff;
 use burn::backend::cuda::{Cuda, CudaDevice};
 use burn_ndarray::{NdArray, NdArrayDevice};
 
-use rust_rl::backend::{resolve_backend, RuntimeBackend};
-use rust_rl::config::{DistInfo, SpoArgs};
-use rust_rl::spo::train;
-use rust_rl::telemetry::{shutdown_otlp_provider, TrainingContext};
+use rust_rl::common::runtime::backend::{resolve_backend, RuntimeBackend};
+use rust_rl::common::config::{DistInfo, SpoArgs};
+use rust_rl::algorithms::spo::train;
+use rust_rl::common::runtime::telemetry::{shutdown_otlp_provider, TrainingContext};
 
 fn main() -> Result<()> {
     let args = SpoArgs::load()?.into_inner();

@@ -6,7 +6,7 @@ use burn::backend::cuda::CudaDevice;
 use cudarc::driver::{CudaContext, DriverError};
 use tracing::warn;
 
-use crate::config::{Args, DeviceType};
+use crate::common::config::{Args, DeviceType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeBackend {
@@ -333,7 +333,7 @@ fn failure_kind_label(kind: CudaProbeFailureKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Args, DeviceType};
+    use crate::common::config::{Args, DeviceType};
 
     fn base_args(device_type: DeviceType) -> Args {
         let mut args = Args::default();

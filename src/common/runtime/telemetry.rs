@@ -26,7 +26,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
 
-use crate::config::{Args, DistInfo};
+use crate::common::config::{Args, DistInfo};
 
 static OTLP_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 

@@ -2,7 +2,7 @@ use rand::Rng;
 use rustpool::core::types::GenericObs;
 use std::sync::Arc;
 
-use crate::buffer_common::{flatten_obs_nonempty, BufferStorage};
+use crate::common::utils::buffer::{flatten_obs_nonempty, BufferStorage};
 
 #[derive(Clone, Debug)]
 pub struct ReplayBatch {

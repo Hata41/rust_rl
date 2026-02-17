@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use bitvec::prelude::*;
 use rustpool::core::types::{ArrayData, GenericObs};
 
-pub use crate::buffer_common::{flatten_obs, flatten_obs_into};
-use crate::buffer_common::BufferStorage;
+pub use crate::common::utils::buffer::{flatten_obs, flatten_obs_into};
+use crate::common::utils::buffer::BufferStorage;
 
 #[derive(Clone, Debug)]
 pub struct BinPackObsView<'a> {

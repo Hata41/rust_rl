@@ -9,19 +9,19 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, span, Level};
 
-use crate::config::{Args, DistInfo};
-use crate::env::{make_env, AsyncEnvPool};
-use crate::env_model::{
+use crate::common::config::{Args, DistInfo};
+use crate::common::runtime::env::{make_env, AsyncEnvPool};
+use crate::common::model::observation_adapter::{
     ObservationAdapter, resolve_observation_adapter,
 };
-use crate::evaluation::{run_eval_with_policy, EvalStats};
-use crate::models::{Actor, Agent, Critic, PolicyInput};
-use crate::ppo::buffer::{flatten_obs_into, Rollout};
-use crate::ppo::loss::{
+use crate::common::runtime::evaluation::{run_eval_with_policy, EvalStats};
+use crate::common::model::models::{Actor, Agent, Critic, PolicyInput};
+use crate::algorithms::ppo::buffer::{flatten_obs_into, Rollout};
+use crate::algorithms::ppo::loss::{
     compute_ppo_losses, logprob_and_entropy, masked_logits, sample_actions_categorical,
 };
-use crate::telemetry::TrainingContext;
-use crate::training_utils::{clip_global_grad_norm, linear_decay_alpha};
+use crate::common::runtime::telemetry::TrainingContext;
+use crate::common::utils::optimization::{clip_global_grad_norm, linear_decay_alpha};
 
 struct PpoOptimizationSummary {
     elapsed: Duration,

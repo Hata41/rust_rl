@@ -9,12 +9,13 @@ See also:
 
 - [onboarding.md](onboarding.md)
 - [architecture.md](architecture.md)
+- [src/common/README.md](../src/common/README.md)
 
 ## Source of truth
 
 Authoritative defaults live in code:
 
-- `src/config.rs`
+- `src/common/config.rs`
 
 Template YAML files are curated presets:
 
@@ -137,6 +138,25 @@ SPO-specific:
 ### `spo`
 
 Search/replay/MPO controls used by SPO trainer.
+
+- `num_particles`
+- `search_depth`
+- `replay_buffer_size`
+- `sample_sequence_length`
+- `sample_period`
+- `dual_lr`
+- `epsilon`
+- `epsilon_policy`
+- `init_log_temperature`
+- `init_log_alpha`
+- `search_gamma`
+- `search_gae_lambda`
+- `root_exploration_dirichlet_alpha`
+- `root_exploration_dirichlet_fraction`
+- `resampling_period`
+- `resampling_ess_threshold`
+- `adaptive_temperature`
+- `fixed_temperature`
 
 ## Runtime guardrails
 

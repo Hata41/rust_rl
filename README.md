@@ -12,6 +12,12 @@ High-throughput PPO/SPO training in Rust on top of `rustpool`, with support for 
 - [Telemetry](docs/telemetry.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
+Source-folder guides:
+
+- [src/README.md](src/README.md)
+- [src/algorithms/README.md](src/algorithms/README.md)
+- [src/common/README.md](src/common/README.md)
+
 ## Quickstart
 
 ### Prerequisites
@@ -42,10 +48,10 @@ cargo run --release --bin spo -- --config spo_config.yaml
 
 - Config loaders are per-binary (`PpoArgs`, `SpoArgs`) on top of a shared schema.
 - Observation adaptation is trait-based (`ObservationAdapter`) with dense/binpack implementations.
-- Evaluation logic is shared in `src/evaluation.rs`.
-- Optimization helpers are shared in `src/training_utils.rs`.
+- Evaluation logic is shared in `src/common/runtime/evaluation.rs`.
+- Optimization helpers are shared in `src/common/utils/optimization.rs`.
 - Telemetry bootstrap is centralized in `TrainingContext`.
-- Environment creation is registry-driven (`register_env_factory`).
+- Environment creation is registry-driven (`register_env_factory` in `src/common/runtime/env.rs`).
 
 ## Config precedence
 
@@ -65,13 +71,13 @@ Compatibility:
 
 - PPO entrypoint: `src/bin/ppo.rs`
 - SPO entrypoint: `src/bin/spo.rs`
-- Config + loaders: `src/config.rs`
-- Env pool + registry: `src/env.rs`
-- Observation adapters: `src/env_model.rs`
-- Shared evaluator: `src/evaluation.rs`
-- Telemetry context: `src/telemetry.rs`
-- PPO trainer: `src/ppo/train.rs`
-- SPO trainer: `src/spo/train.rs`
+- Config + loaders: `src/common/config.rs`
+- Env pool + registry: `src/common/runtime/env.rs`
+- Observation adapters: `src/common/model/observation_adapter.rs`
+- Shared evaluator: `src/common/runtime/evaluation.rs`
+- Telemetry context: `src/common/runtime/telemetry.rs`
+- PPO trainer: `src/algorithms/ppo/train.rs`
+- SPO trainer: `src/algorithms/spo/train.rs`
 
 ## CUDA behavior
 

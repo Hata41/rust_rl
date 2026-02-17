@@ -5,6 +5,12 @@ This page documents PPO runtime behavior after modular refactor.
 For static boundaries, see [architecture.md](architecture.md).
 For SPO runtime, see [spo-training-loop.md](spo-training-loop.md).
 
+Source guides:
+
+- [src/algorithms/ppo/README.md](../src/algorithms/ppo/README.md)
+- [src/common/model/README.md](../src/common/model/README.md)
+- [src/common/runtime/README.md](../src/common/runtime/README.md)
+
 ## Runtime sequence
 
 `src/bin/ppo.rs` -> `PpoArgs::load` -> `TrainingContext::initialize` -> `PpoTrainer::run`.
@@ -23,12 +29,12 @@ Core flow per update:
 ## Key components
 
 - Entrypoint: `src/bin/ppo.rs`
-- Trainer wrapper: `src/ppo/train.rs` (`PpoTrainer`)
-- Optimizer phase: `src/ppo/train.rs` (`PpoOptimizer`)
-- Shared evaluator: `src/evaluation.rs`
-- Observation adapter: `src/env_model.rs`
-- Rollout buffer: `src/ppo/buffer.rs`
-- PPO losses: `src/ppo/loss.rs`
+- Trainer wrapper: `src/algorithms/ppo/train.rs` (`PpoTrainer`)
+- Optimizer phase: `src/algorithms/ppo/train.rs` (`PpoOptimizer`)
+- Shared evaluator: `src/common/runtime/evaluation.rs`
+- Observation adapter: `src/common/model/observation_adapter.rs`
+- Rollout buffer: `src/algorithms/ppo/buffer.rs`
+- PPO losses: `src/algorithms/ppo/loss.rs`
 
 ## Determinism and seeds
 
@@ -53,8 +59,8 @@ This is expected and must stay consistent in rollout bookkeeping and eval aggreg
 
 ## Edit map
 
-- Sampling/loss behavior: `src/ppo/loss.rs`
-- Optimizer phase: `src/ppo/train.rs` (`PpoOptimizer`)
-- Eval behavior: `src/evaluation.rs` + PPO eval closure in `src/ppo/train.rs`
-- Observation conversion: `src/env_model.rs`
-- Rollout storage: `src/ppo/buffer.rs`
+- Sampling/loss behavior: `src/algorithms/ppo/loss.rs`
+- Optimizer phase: `src/algorithms/ppo/train.rs` (`PpoOptimizer`)
+- Eval behavior: `src/common/runtime/evaluation.rs` + PPO eval closure in `src/algorithms/ppo/train.rs`
+- Observation conversion: `src/common/model/observation_adapter.rs`
+- Rollout storage: `src/algorithms/ppo/buffer.rs`
