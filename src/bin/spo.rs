@@ -2,6 +2,7 @@ use anyhow::Result;
 use burn::backend::autodiff::Autodiff;
 use burn::backend::cuda::{Cuda, CudaDevice};
 use burn_ndarray::{NdArray, NdArrayDevice};
+use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -10,7 +11,7 @@ use rust_rl::backend::{resolve_backend, RuntimeBackend};
 use rust_rl::config::{Args, DistInfo};
 use rust_rl::spo::train;
 use rust_rl::telemetry::{
-    init_otlp_layer, shutdown_otlp_provider, DashboardFormatter, MetricRegistry,
+    create_mlflow_run, init_mlflow_metrics, DashboardFormatter, MetricRegistry,
 };
 
 fn main() -> Result<()> {
@@ -31,23 +32,36 @@ fn main() -> Result<()> {
             .with_thread_ids(false)
             .with_thread_names(false)
             .event_format(formatter);
-        let otlp_endpoint = if args.otlp_endpoint.ends_with("/v1/traces") {
-            args.otlp_endpoint.clone()
+        let run_id = if let Some(run_id) = args.mlflow_run_id.clone() {
+            Some(run_id)
         } else {
-            format!("{}/v1/traces", args.otlp_endpoint.trim_end_matches('/'))
-        };
-        let otlp_layer = match init_otlp_layer("rust_rl.spo", &otlp_endpoint, "0") {
-            Ok(layer) => Some(layer),
-            Err(error) => {
-                eprintln!("failed to initialize OTLP tracing: {error}");
-                None
+            let experiment_id =
+                std::env::var("MLFLOW_EXPERIMENT_ID").unwrap_or_else(|_| "0".to_string());
+            let run_name = format!("rust_rl.spo.pid-{}", std::process::id());
+            match create_mlflow_run(&args.otlp_endpoint, &experiment_id, &run_name) {
+                Ok(run_id) => {
+                    eprintln!(
+                        "created MLflow run_id='{run_id}' in experiment_id='{experiment_id}'"
+                    );
+                    Some(run_id)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "warning: missing --mlflow-run-id and auto-create failed: {error}; MLflow metrics export is disabled"
+                    );
+                    None
+                }
             }
         };
+        let mlflow_layer = run_id
+            .as_deref()
+            .map(|resolved_run_id| init_mlflow_metrics(resolved_run_id, &args.otlp_endpoint));
         let _ = tracing_subscriber::registry()
-            .with(otlp_layer)
+            .with(mlflow_layer)
             .with(filter)
             .with(fmt_layer)
             .try_init();
+        info!(category = "MISC", config = ?args, "config_trace");
     }
 
     let backend = resolve_backend(&args);
@@ -58,6 +72,5 @@ fn main() -> Result<()> {
         }
     };
 
-    shutdown_otlp_provider();
     result
 }

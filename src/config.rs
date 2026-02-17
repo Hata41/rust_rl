@@ -210,6 +210,10 @@ pub struct Args {
     /// OTLP endpoint for telemetry export (use reverse SSH tunnel target, e.g. localhost).
     #[arg(long, default_value = "http://localhost:5000")]
     pub otlp_endpoint: String,
+
+    /// MLflow run ID used to log scalar metrics.
+    #[arg(long)]
+    pub mlflow_run_id: Option<String>,
 }
 
 impl Default for Args {
@@ -265,6 +269,7 @@ impl Default for Args {
             log_level: "info".to_string(),
             backend_logs_visible: false,
             otlp_endpoint: "http://localhost:5000".to_string(),
+            mlflow_run_id: None,
         }
     }
 }
@@ -289,6 +294,7 @@ struct LoggingConfig {
     log_level: Option<String>,
     backend_logs_visible: Option<bool>,
     otlp_endpoint: Option<String>,
+    mlflow_run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -472,6 +478,9 @@ impl Args {
         set_if_some!(log_level, file.logging.log_level);
         set_if_some!(backend_logs_visible, file.logging.backend_logs_visible);
         set_if_some!(otlp_endpoint, file.logging.otlp_endpoint);
+        if let Some(value) = file.logging.mlflow_run_id {
+            self.mlflow_run_id = Some(value);
+        }
 
         set_if_some!(num_particles, file.spo.num_particles);
         set_if_some!(search_depth, file.spo.search_depth);
@@ -545,6 +554,7 @@ impl Args {
         set_if_cli!(log_level, "log_level");
         set_if_cli!(backend_logs_visible, "backend_logs_visible");
         set_if_cli!(otlp_endpoint, "otlp_endpoint");
+        set_if_cli!(mlflow_run_id, "mlflow_run_id");
 
         set_if_cli!(num_particles, "num_particles");
         set_if_cli!(search_depth, "search_depth");

@@ -405,6 +405,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
         };
         let current_actor_lr = args.actor_lr * alpha;
         let current_critic_lr = args.critic_lr * alpha;
+        let timesteps = (update + 1) * args.rollout_length * args.num_envs;
 
         let rollout_started = Instant::now();
         let mut search_duration_ms = 0.0f64;
@@ -735,10 +736,9 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
                 .as_secs_f64()
                 .max(1.0e-9);
             let steps_per_second = rollout_steps / total_update_secs;
-            let timesteps = (update + 1) * args.rollout_length * args.num_envs;
-
             info!(
                 category = "TRAINER",
+                timesteps,
                 policy_version = update + 1,
                 actor_loss = mean_actor_loss,
                 critic_loss = mean_critic_loss,
@@ -753,6 +753,7 @@ pub fn run<B: AutodiffBackend>(args: Args, dist: DistInfo, device: B::Device) ->
 
             info!(
                 category = "ACTOR",
+                timesteps,
                 phase = "Training/Actor",
                 mean_return,
                 max_return,
