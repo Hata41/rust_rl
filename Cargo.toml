@@ -37,6 +37,10 @@ rustpool = { path = "../rustpool", package = "_rustpool", default-features = fal
 burn = { version = "=0.20.1", features = ["cuda", "autodiff", "ndarray"] }
 burn-ndarray = "=0.20.1"
 cudarc = { version = "=0.18.2", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
+opentelemetry = "0.28"
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.28"
+tracing-opentelemetry = "0.29"
 
 [patch.crates-io]
 cubecl-cuda = { git = "https://github.com/Hata41/cubecl.git", rev = "2cef73c4157db7adb88892f862c85ae04dc3956a" }

@@ -1,10 +1,20 @@
 use std::collections::HashMap;
 use std::fmt;
+use anyhow::Result;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use opentelemetry_sdk::Resource;
+use std::sync::OnceLock;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Registry;
+
+static OTLP_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 #[derive(Default)]
 pub struct DashboardVisitor {
@@ -187,5 +197,41 @@ where
         }
 
         writeln!(writer)
+    }
+}
+
+pub fn init_otlp_layer(
+    service_name: &str,
+    endpoint: &str,
+) -> Result<OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>> {
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .build()?;
+
+    let batch_config = BatchConfigBuilder::default()
+        .with_max_queue_size(4096)
+        .with_max_export_batch_size(512)
+        .build();
+
+    let span_processor = BatchSpanProcessor::builder(exporter)
+        .with_batch_config(batch_config)
+        .build();
+
+    let provider = SdkTracerProvider::builder()
+        .with_span_processor(span_processor)
+        .with_resource(Resource::builder().with_service_name(service_name.to_string()).build())
+        .build();
+
+    let tracer = provider.tracer(service_name.to_string());
+    let _ = OTLP_PROVIDER.set(provider.clone());
+    opentelemetry::global::set_tracer_provider(provider);
+
+    Ok(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
+pub fn shutdown_otlp_provider() {
+    if let Some(provider) = OTLP_PROVIDER.get() {
+        let _ = provider.shutdown();
     }
 }
