@@ -107,11 +107,11 @@ Use this when training runs on a remote host (e.g. `BareMetal`) and MLflow runs 
 Example `~/.ssh/config` entry:
 
 ```ssh_config
-Host BareMetal
-	HostName 185.144.24.60
-	IdentityFile /home/sreboul/.ssh/id_ed25519
-	User sreboul
-	Port 2223
+Host REMOTE_TRAINING_HOST
+	HostName YOUR_REMOTE_HOST_OR_IP
+	IdentityFile ~/.ssh/YOUR_PRIVATE_KEY
+	User YOUR_REMOTE_USER
+	Port YOUR_SSH_PORT
 	RemoteForward 5000 localhost:5000
 ```
 
